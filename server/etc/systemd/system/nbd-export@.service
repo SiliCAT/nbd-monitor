@@ -1,0 +1,29 @@
+[Unit]
+Description=NBD export on port %i
+Requires=nbd-export@%i.socket
+Wants=nbd-control.socket
+After=network.target nbd-control.socket nbd-export@%i.socket
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+
+Sockets=nbd-export@%i.socket
+ExecStart=/usr/local/libexec/nbd-server export %i
+ExecStopPost=/usr/local/libexec/nbd-server finish %i
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+TimeoutStopSec=180s
+KillMode=control-group
+Restart=no
+
+RuntimeDirectory=nbd-server
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=nbd-server
+StateDirectoryMode=0700

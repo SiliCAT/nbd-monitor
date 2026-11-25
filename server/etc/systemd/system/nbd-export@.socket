@@ -1,0 +1,10 @@
+[Unit]
+Description=NBD data listener on port %i
+
+[Socket]
+ListenStream=0.0.0.0:%i
+Accept=no
+Service=nbd-export@%i.service
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,624 @@
+#!/bin/bash
+# nbd-monitor v0.4 - 有限补做 detach（默认关闭）+ v0.3 心跳监护：run / disconnect / report
+# 仅支持 TCP nbdtab、单客户端单连接、普通文件系统测试；不支持 swap。
+# Type=notify 在 previous 完成后、真实数据连接前报告 READY。
+# 原生 nbd@ 先停止，monitor ExecStop=disconnect 随后核验；仅显式启用后有限补做 detach。
+
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+log() { printf 'nbd-monitor: %s\n' "$*" >&2; }
+die() { log "错误：$*"; exit 1; }
+
+# 独立子进程进行一次 TCP 请求；外层 timeout 同时限制 connect 和 read。
+wire() {
+    local host=$1 port=$2 reply
+    shift 2
+    [[ -n $host && $host != *'/'* && $host != *$'\n'* && $host != *$'\r'* ]] || return 2
+    [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || return 2
+    exec 3<>"/dev/tcp/$host/$port" || return 1
+    printf '%s\n' "$@" END >&3 || return 1
+    IFS= read -r -t 2 reply <&3 || return 1
+    exec 3>&-
+    [[ $reply =~ ^result=(none|ok|wait|error|complete|incomplete|abnormal|ended)$ ]] || return 1
+    printf '%s\n' "$reply"
+}
+
+if [[ ${1:-} == _wire ]]; then
+    (($# >= 4)) || exit 2
+    shift
+    wire "$@"
+    exit $?
+fi
+
+request() {
+    timeout --signal=TERM --kill-after=1s "${request_timeout_sec}s" \
+        "$0" _wire "$control_host" "$control_port" "$@"
+}
+
+# 用 nbd-client -c 的退出码 + sysfs 扇区数联合观测。
+# 回显 connected/disconnected/unknown；unknown 绝不升格为 zero=yes。
+device_status() {
+    local rc sectors
+    if "$nbd_client" -c "/dev/$dev" >/dev/null 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    if [[ ! -r $sys_class_block/$dev/size ]]; then
+        printf 'unknown\n'; return
+    fi
+    IFS= read -r sectors < "$sys_class_block/$dev/size" || sectors=
+    if [[ ! $sectors =~ ^[0-9]+$ ]]; then
+        printf 'unknown\n'; return
+    fi
+    if (( rc == 0 && sectors > 0 )); then
+        printf 'connected\n'
+    elif (( rc == 1 && sectors == 0 )); then
+        printf 'disconnected\n'
+    else
+        printf 'unknown\n'
+    fi
+}
+
+# 状态只接受已知键；禁止通过 source/eval 执行文件内容。
+load_state() {
+    declare -gA saved=()
+    local line key value
+    [[ -f $state_file ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *=* ]] || die '本地状态格式损坏'
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in client|host|port|export|session|boot|phase) ;; *) die "本地状态含未知键：$key" ;; esac
+        [[ ! ${saved[$key]+present} ]] || die "本地状态重复键：$key"
+        saved[$key]=$value
+    done < "$state_file"
+    for key in client host port export session boot phase; do
+        [[ ${saved[$key]+present} ]] || die "本地状态缺少键：$key"
+    done
+    [[ ${saved[phase]} == running || ${saved[phase]} == closed ]] || die '本地状态阶段未知'
+    [[ ${saved[session]} =~ ^[0-9a-fA-F-]{36}$ ]] || die '本地 session 无效'
+}
+
+save_state() {
+    local phase=$1 tmp="$state_file.tmp.$$"
+    printf '%s\n' \
+        "client=$client_id" "host=$data_host" "port=$data_port" \
+        "export=$data_export" "session=$session" "boot=$boot_id" \
+        "phase=$phase" > "$tmp"
+    mv -f -- "$tmp" "$state_file"
+}
+
+# 监护事实与会话状态分别保存，避免心跳的短更新覆盖 disconnect 的 phase=closed。
+# health.state 带 session：同一设备新轮不会继承旧轮的异常。
+load_health() {
+    local line key value
+    channel=unknown
+    heartbeat_last=none
+    sticky_fault=unknown
+    close_result=unknown
+    detach_result=unknown
+    detach_count=0
+    [[ -f $health_file ]] || return 0
+    declare -A observed=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *=* ]] || die '监护状态格式损坏'
+        key=${line%%=*}; value=${line#*=}
+        case $key in session|channel|heartbeat_last|fault|close_result|detach_result|detach_count) ;; *) die "监护状态含未知键：$key" ;; esac
+        [[ ! ${observed[$key]+present} ]] || die "监护状态重复键：$key"
+        observed[$key]=$value
+    done < "$health_file"
+    # 旧轮或缺少关联标识的附属文件不能影响当前 session。
+    [[ ${observed[session]-} == "$session" ]] || return 0
+    channel=${observed[channel]-unknown}
+    heartbeat_last=${observed[heartbeat_last]-none}
+    sticky_fault=${observed[fault]-none}
+    close_result=${observed[close_result]-none}
+    detach_result=${observed[detach_result]-none}
+    detach_count=${observed[detach_count]-0}
+    case $channel in unknown|online|unreachable) ;; *) die '监护 channel 状态损坏' ;; esac
+    case $heartbeat_last in none|ok|abnormal|ended|error|unexpected|unavailable) ;; *) die '监护 heartbeat_last 状态损坏' ;; esac
+    case $sticky_fault in unknown|none|heartbeat_abnormal|server_ended_while_connected|heartbeat_error|heartbeat_unexpected|server_close_abnormal|detach_recovered|detach_blocked|detach_failed) ;; *) die '监护 fault 状态损坏' ;; esac
+    case $close_result in unknown|none|complete|abnormal) ;; *) die '监护 close_result 状态损坏' ;; esac
+    case $detach_result in unknown|none|disabled|blocked|recovered|failed) ;; *) die '监护 detach_result 状态损坏' ;; esac
+    [[ $detach_count =~ ^[0-9]+$ ]] || die '监护 detach_count 状态损坏'
+}
+
+save_health() {
+    local tmp="$health_file.tmp.$$"
+    printf '%s\n' \
+        "session=$session" "channel=$channel" "heartbeat_last=$heartbeat_last" \
+        "fault=$sticky_fault" "close_result=$close_result" \
+        "detach_result=$detach_result" "detach_count=$detach_count" > "$tmp"
+    mv -f -- "$tmp" "$health_file"
+}
+
+# 心跳更新只在本轮仍为 running 时落地；避免与 ExecStop 的收尾覆盖竞态。
+commit_health_if_running() {
+    local fd observed_channel=$channel observed_last=$heartbeat_last observed_fault=$sticky_fault
+    exec {fd}> "$run_dir/run.lock" || return 1
+    if ! flock -w 1 "$fd"; then
+        exec {fd}>&-
+        return 1
+    fi
+    if load_state && [[ ${saved[session]} == "$session" && ${saved[phase]} == running ]]; then
+        # disconnect 也写 health.state：读取最新值再合并，避免 20 秒的补做流程
+        # 结束后被延迟的 heartbeat 覆盖 detach_result / detach_count / fault。
+        load_health
+        channel=$observed_channel
+        heartbeat_last=$observed_last
+        if [[ $sticky_fault == none || $sticky_fault == unknown ]]; then
+            sticky_fault=$observed_fault
+        fi
+        save_health
+    fi
+    exec {fd}>&-
+}
+
+# 支持简单 INI，既不 shell source，也不允许未识别键静默生效。
+parse_config() {
+    local line section= key value scope seenkey
+    declare -gA cfg=() seen=()
+    [[ -r $config_file ]] || die "无法读取 $config_file"
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line != *$'\r'* ]] || die '配置文件不得使用 CRLF'
+        line=${line#"${line%%[!$' \t']*}"}
+        line=${line%"${line##*[!$' \t']}"}
+        [[ -n $line && $line != \#* ]] || continue
+        if [[ $line == \[*\] ]]; then
+            section=${line:1:${#line}-2}
+            [[ $section == global || $section =~ ^nbd[0-9]+$ ]] || die "配置段无效：$section"
+            [[ ! ${seen["section|$section"]+present} ]] || die "重复配置段：$section"
+            seen["section|$section"]=yes
+            continue
+        fi
+        [[ -n $section && $line == *=* ]] || die "配置行无效：$line"
+        key=${line%%=*}; value=${line#*=}
+        key=${key#"${key%%[!$' \t']*}"}; key=${key%"${key##*[!$' \t']}"}
+        value=${value#"${value%%[!$' \t']*}"}; value=${value%"${value##*[!$' \t']}"}
+        case $key in
+            client_id|control_port|control_host|heartbeat_interval_sec|request_timeout_sec|startup_report_timeout_sec|detach_attempts|detach_interval_sec|detach_enabled) ;;
+            *) die "未知配置项：$key" ;;
+        esac
+        if [[ $section != global && $key != control_host && $key != control_port ]]; then
+            die "设备段只支持 control_host/control_port：$key"
+        fi
+        seenkey="$section|$key"
+        [[ ! ${seen[$seenkey]+present} ]] || die "重复配置项：$seenkey"
+        seen[$seenkey]=yes
+        cfg[$seenkey]=$value
+    done < "$config_file"
+}
+
+parse_nbdtab() {
+    local line part item opt option seen_count=0
+    local -a fields=() options=()
+    [[ -r $nbdtab ]] || die "无法读取 $nbdtab"
+    data_host= data_port=10809 data_export=
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%\#*}
+        read -r -a fields <<< "$line"
+        ((${#fields[@]} > 0)) || continue
+        [[ ${fields[0]} == "$dev" ]] || continue
+        ((seen_count+=1))
+        ((${#fields[@]} == 3 || ${#fields[@]} == 4)) || die 'nbdtab 目标行字段数不符'
+        data_host=${fields[1]}
+        data_export=${fields[2]}
+        [[ $data_export != '""' && $data_export != "''" ]] || die '当前版本不支持 nbdtab 空导出名'
+        if ((${#fields[@]} == 4)); then
+            IFS=, read -r -a options <<< "${fields[3]}"
+            for opt in "${options[@]}"; do
+                case $opt in
+                    port=*) data_port=${opt#port=} ;;
+                    persist|swap|unix|conns=*|_*) die "当前阶段不支持 nbdtab 选项：$opt" ;;
+                    *) ;; # 原生 nbd-client 自行解释其它参数
+                esac
+            done
+        fi
+    done < "$nbdtab"
+    (( seen_count == 1 )) || die "nbdtab 中 $dev 条目数为 $seen_count（必须恰好一条）"
+    [[ $data_port =~ ^[1-9][0-9]{0,4}$ ]] || die '数据端口不是规范整数'
+    ((10#$data_port <= 65535)) || die '数据端口超范围'
+    [[ $data_host != *'/'* && -n $data_host && $data_host != *$'\r'* ]] || die '数据主机地址无效'
+}
+
+# 仅当原生 nbd@ 已停止以后，才允许有限补做 detach。
+# 连接 PID 是防止旧轮误操作新轮的附加保护，而非内核级原子锁。
+check_connection_identity() {
+    local x name value recorded_session= recorded_pid= live
+    [[ -r $connection_file ]] || { log '无连接身份快照'; return 1; }
+    while IFS= read -r x || [[ -n $x ]]; do
+        name=${x%%=*}; value=${x#*=}
+        case $name in
+            session) recorded_session=$value ;;
+            pid) recorded_pid=$value ;;
+            *) return 1 ;;
+        esac
+    done < "$connection_file"
+    [[ $recorded_session == "$session" && $recorded_pid =~ ^[1-9][0-9]*$ ]] || return 1
+    live=$($nbd_client -c "/dev/$dev" 2>/dev/null) || return 1
+    [[ $live == "$recorded_pid" ]]
+}
+
+# 动态筛查：本 mount namespace 的 block major:minor、swap、以及 sysfs holders。
+# 该检查不是对全部进程/namespace I/O 的原子证明；无法观测时一律拒绝补做。
+check_detach_safety() {
+    local entry id holder src rest canonical
+    local -a block_entries=("$sys_class_block/$dev")
+    local -a major_minor=()
+    for entry in "$sys_class_block"/"$dev"p[0-9]*; do
+        [[ -e $entry ]] && block_entries+=("$entry")
+    done
+    [[ -r /proc/self/mountinfo && -r /proc/swaps ]] || { log '无法读取挂载/swap 状态'; return 1; }
+    for entry in "${block_entries[@]}"; do
+        [[ -r $entry/dev && -d $entry/holders ]] || { log "缺失 sysfs 使用信息：$entry"; return 1; }
+        IFS= read -r id < "$entry/dev" || return 1
+        [[ $id =~ ^[0-9]+:[0-9]+$ ]] || return 1
+        major_minor+=("$id")
+        for holder in "$entry"/holders/*; do
+            [[ -e $holder ]] || continue
+            log "块设备有上层 holder：$holder"
+            return 1
+        done
+    done
+    for id in "${major_minor[@]}"; do
+        if awk -v dev_id="$id" '$3 == dev_id { found=1; exit } END { exit !found }' /proc/self/mountinfo; then
+            log "设备或分区仍被挂载（major:minor=$id）"
+            return 1
+        fi
+    done
+    # swap 设备支持 /dev 下的别名，经过 readlink -f 后匹配设备本体或分区。
+    while read -r src rest; do
+        [[ $src == Filename ]] && continue
+        canonical=$(readlink -f -- "$src" 2>/dev/null) || { log "无法识别 swap 来源：$src"; return 1; }
+        if [[ $canonical == "/dev/$dev" || $canonical =~ ^/dev/${dev}p[0-9]+$ ]]; then
+            log "设备正在被 swap 使用：$src"
+            return 1
+        fi
+    done < /proc/swaps
+    return 0
+}
+
+# 此函数必须在 run.lock 被持有、原生 nbd@ 已停止的条件下执行。
+# 三次上限 / 30 秒总预算，单次命令另有限时；超时即停止，避免重叠调用。
+rescue_detach() {
+    local start=$1 attempt rc last_start remaining
+    if [[ $detach_enabled != yes ]]; then
+        detach_result=disabled
+        log '补做 detach 未显式启用；保留连接'
+        save_health
+        return 1
+    fi
+    if ! check_connection_identity || ! check_detach_safety; then
+        detach_result=blocked
+        [[ $sticky_fault != none ]] || sticky_fault=detach_blocked
+        save_health
+        log '补做前身份或上层占用检查失败；拒绝执行 detach'
+        return 1
+    fi
+    for ((attempt=1; attempt<=detach_attempts; attempt++)); do
+        remaining=$(( 30 - (SECONDS - start) ))
+        ((remaining >= 5)) || break
+        if ! check_connection_identity || ! check_detach_safety; then
+            detach_result=blocked
+            [[ $sticky_fault != none ]] || sticky_fault=detach_blocked
+            save_health
+            return 1
+        fi
+        last_start=$SECONDS
+        detach_count=$attempt
+        log "补做 detach：第 $attempt/$detach_attempts 次（最多 30 秒）"
+        rc=0
+        timeout --signal=TERM --kill-after=1s 3s "$nbd_client" -d "/dev/$dev" || rc=$?
+        save_health
+        if ((rc == 124 || rc == 137)); then
+            detach_result=failed
+            [[ $sticky_fault != none ]] || sticky_fault=detach_failed
+            save_health
+            log "detach 命令超时/被强制结束 rc=$rc；不再尝试，避免与残余任务重叠"
+            return 1
+        fi
+        if [[ $(device_status) == disconnected ]]; then
+            detach_result=recovered
+            [[ $sticky_fault != none ]] || sticky_fault=detach_recovered
+            save_health
+            log "补做 detach 后设备归零，命令退出码=$rc"
+            return 0
+        fi
+        log "补做后设备仍未确认归零，命令退出码=$rc"
+        ((attempt < detach_attempts)) || break
+        remaining=$(( 30 - (SECONDS - start) ))
+        ((remaining > detach_interval_sec + 2)) || break
+        # 周期以本次尝试起始时间为准，而不是在命令结束后再睡满间隔。
+        delay=$((detach_interval_sec - (SECONDS - last_start)))
+        ((delay > 0)) && sleep "$delay"
+    done
+    detach_result=failed
+    [[ $sticky_fault != none ]] || sticky_fault=detach_failed
+    save_health
+    log '规定的补做次数/时间窗口耗尽，设备仍未确认归零'
+    return 1
+}
+
+usage() {
+    printf '%s\n' '用法：nbd-monitor run|disconnect|report nbdN' >&2
+    exit 2
+}
+
+(($# == 2)) || usage
+mode=$1 dev=$2
+case $mode in run|disconnect|report) ;; *) usage ;; esac
+[[ $dev =~ ^nbd(0|[1-9][0-9]*)$ ]] || die "设备实例名无效：$dev"
+(( EUID == 0 )) || die '需要 root 身份'
+
+config_file=${NBD_MONITOR_CONFIG:-/etc/nbd-monitor.conf}
+nbdtab=${NBD_MONITOR_NBDTAB:-/etc/nbdtab}
+base_run_dir=${NBD_MONITOR_RUN_DIR:-/run/nbd-monitor}
+nbd_client=${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}
+sys_class_block=${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}
+systemctl_bin=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
+[[ $base_run_dir == /* ]] || die '运行目录必须为绝对路径'
+[[ -e $sys_class_block/$dev/size ]] || die "设备 $dev 没有 sysfs size"
+
+parse_config
+parse_nbdtab
+
+client_id=${cfg['global|client_id']-}
+[[ $client_id =~ ^[a-zA-Z0-9_.-]{1,128}$ ]] || die 'client_id 只能是 1-128 位字母数字及 _.-'
+control_host=${cfg["$dev|control_host"]-${cfg['global|control_host']-$data_host}}
+control_port=${cfg["$dev|control_port"]-${cfg['global|control_port']-10921}}
+heartbeat_interval_sec=${cfg['global|heartbeat_interval_sec']-10}
+request_timeout_sec=${cfg['global|request_timeout_sec']-2}
+startup_report_timeout_sec=${cfg['global|startup_report_timeout_sec']-5}
+detach_attempts=${cfg['global|detach_attempts']-3}
+detach_interval_sec=${cfg['global|detach_interval_sec']-10}
+detach_enabled=${cfg['global|detach_enabled']-no}
+[[ $detach_enabled == no || $detach_enabled == yes ]] || die 'detach_enabled 必须为 yes/no'
+for value in "$heartbeat_interval_sec" "$request_timeout_sec" "$startup_report_timeout_sec" "$detach_attempts" "$detach_interval_sec"; do
+    [[ $value =~ ^[1-9][0-9]{0,2}$ ]] || die '时间/次数配置需为 1-999 正整数'
+done
+((request_timeout_sec <= 5 && heartbeat_interval_sec >= 1)) || die '控制请求预算必须 <= 5 秒'
+(( detach_attempts <= 3 )) || die '目前最多允许 3 次补做 detach'
+(( detach_interval_sec >= 5 )) || die '补做间隔必须 >= 5 秒'
+[[ $control_port =~ ^[1-9][0-9]{0,4}$ ]] || die '控制端口无效'
+((10#$control_port <= 65535)) || die '控制端口超范围'
+[[ -n $control_host && $control_host != *'/'* && $control_host != *$'\r'* ]] || die '控制主机无效'
+
+install -d -o root -g root -m 0700 "$base_run_dir/$dev"
+run_dir=$base_run_dir/$dev
+state_file=$run_dir/session.state
+health_file=$run_dir/health.state
+connection_file=$run_dir/connection.state
+IFS= read -r boot_id < /proc/sys/kernel/random/boot_id
+
+if [[ $mode == report ]]; then
+    printf 'device=%s\n' "$dev"
+    printf 'device_status=%s\n' "$(device_status)"
+    if load_state; then
+        for key in client host port export session boot phase; do
+            printf '%s=%s\n' "$key" "${saved[$key]}"
+        done
+        session=${saved[session]}
+        load_health
+        printf 'channel=%s\nheartbeat_last=%s\nfault=%s\nclose_result=%s\ndetach_result=%s\ndetach_count=%s\n' \
+            "$channel" "$heartbeat_last" "$sticky_fault" "$close_result" "$detach_result" "$detach_count"
+    else
+        printf 'session=none\n'
+    fi
+    exit 0
+fi
+
+# agent.lock 由 run 长期持有，排除重复的 monitor 守护进程。
+# run.lock 只保护会话建立/交接阶段，不能在心跳期间占住，否则 ExecStop 会与 run 自锁。
+if [[ $mode == run ]]; then
+    exec {agent_fd}> "$run_dir/agent.lock"
+    flock -n "$agent_fd" || die '本设备已有 monitor run 在运行'
+fi
+exec {run_fd}> "$run_dir/run.lock"
+if [[ $mode == disconnect ]]; then
+    flock -w 5 "$run_fd" || die '会话建立尚未结束或资源锁忙'
+else
+    flock -n "$run_fd" || die 'run/disconnect 正在操作本地会话'
+fi
+
+if [[ $mode == run ]]; then
+    recovered=no
+    if load_state; then
+        if [[ ${saved[phase]} == running ]]; then
+            [[ ${saved[boot]} == "$boot_id" && ${saved[client]} == "$client_id" && \
+               ${saved[host]} == "$data_host" && ${saved[port]} == "$data_port" && \
+               ${saved[export]} == "$data_export" ]] || die '未结束 session 的资源身份发生变化，拒绝继续'
+            [[ $(device_status) == connected ]] || die '旧 session 未收尾且当前设备未证实仍连接，请先检查/收尾'
+            session=${saved[session]}
+            load_health
+            recovered=yes
+            log "恢复未结束 session=$session；不生成新 session"
+        fi
+    fi
+
+    if [[ $recovered == no ]]; then
+        # 在原始 NBD 连接之前进行 previous；请求失败要记录未知，而不是假装 none。
+        log "查询 previous: client=$client_id target=$data_host:$data_port/$data_export"
+        start=$SECONDS
+        got_previous=no
+        while (( SECONDS - start < startup_report_timeout_sec )); do
+            if reply=$(request \
+                'op=previous' "client=$client_id" "host=$data_host" \
+                "port=$data_port" "export=$data_export"); then
+                log "previous: $reply"
+                got_previous=yes
+                break
+            fi
+            sleep 1
+        done
+        [[ $got_previous == yes ]] || log 'previous 无有效回复：上轮结果未知（不等于 none）'
+
+    fi
+
+    # 两条路径都要求在真实连接之前报告 READY（如果由 Type=notify 启动）。
+    if [[ -n ${NOTIFY_SOCKET:-} ]]; then
+        /usr/bin/systemd-notify --ready --pid=parent --status="启动准备完成，等待 /dev/$dev 连接" \
+            || die '无法向 systemd 报告启动就绪'
+        log 'systemd READY=1（不等待数据连接，以免形成依赖环）'
+    fi
+    if [[ $recovered == no ]]; then
+        log "等待 /dev/$dev 实际建立连接（最多 60 秒）"
+        start=$SECONDS
+        while [[ $(device_status) != connected ]]; do
+            (( SECONDS - start < 60 )) || die '等待 NBD 连接超时'
+            sleep 1
+        done
+        IFS= read -r session < /proc/sys/kernel/random/uuid
+        save_state running
+        channel=unknown
+        heartbeat_last=none
+        sticky_fault=none
+        close_result=none
+        detach_result=none
+        detach_count=0
+        save_health
+        # 新一轮连接的 PID 与 session 关联。缺失 PID 只禁止补做，不妨碍继续监护。
+        current_pid=$($nbd_client -c "/dev/$dev" 2>/dev/null || :)
+        [[ $current_pid =~ ^[1-9][0-9]*$ ]] || current_pid=unknown
+        printf 'session=%s\npid=%s\n' "$session" "$current_pid" > "$connection_file.tmp.$$"
+        mv -f -- "$connection_file.tmp.$$" "$connection_file"
+        [[ $current_pid != unknown ]] || log '无法读取可靠连接 PID；本轮禁止自动补做 detach'
+        log "新 session=$session，已先保存本轮上下文"
+    fi
+
+    start=$SECONDS
+    registered=no
+    while (( SECONDS - start < 30 )); do
+        if reply=$(request \
+            'op=register' "client=$client_id" "host=$data_host" \
+            "port=$data_port" "export=$data_export" "session=$session"); then
+            if [[ $reply == result=ok ]]; then
+                log 'register: result=ok'
+                registered=yes
+                break
+            fi
+            log "register: $reply"
+            [[ $reply != result=error ]] || die 'register 被服务端拒绝；保留 session 供诊断'
+        else
+            log 'register 无有效回复，按同一 session 重试'
+        fi
+        sleep 1
+    done
+    [[ $registered == yes ]] || die 'register 超时；保留 session 供诊断'
+
+    # 关键：放开会话状态锁，让 systemd 的 ExecStop=disconnect 能与 run 同时存在。
+    flock -u "$run_fd"
+    exec {run_fd}>&-
+    count=0
+    detached=no
+    while :; do
+        if load_state && [[ ${saved[phase]} == closed ]]; then
+            log '本轮已由 disconnect 收尾，monitor 结束'
+            exit 0
+        fi
+        case $(device_status) in
+            disconnected)
+                if [[ $detached == no ]]; then
+                    log '本地设备已解除；暂停心跳，等待原生 nbd@ 停止作业完成及 ExecStop=disconnect'
+                    detached=yes
+                fi
+                ;;
+            connected)
+                [[ $detached == no ]] || die '设备在本轮断开后又连接，拒绝以旧 session 监控新连接'
+                ;;
+            unknown) log '本地设备状态未知，不宣称断开' ;;
+        esac
+        if [[ $detached == no ]] && (( count % heartbeat_interval_sec == 0 )); then
+            if reply=$(request 'op=heartbeat' "session=$session"); then
+                channel=online
+                case $reply in
+                    result=ok)
+                        heartbeat_last=ok
+                        log 'heartbeat: result=ok'
+                        ;;
+                    result=abnormal)
+                        heartbeat_last=abnormal
+                        [[ $sticky_fault != none && $sticky_fault != unknown ]] || sticky_fault=heartbeat_abnormal
+                        log 'heartbeat: result=abnormal；已记录故障，继续监护，不执行 detach'
+                        ;;
+                    result=ended)
+                        heartbeat_last=ended
+                        [[ $sticky_fault != none && $sticky_fault != unknown ]] || sticky_fault=server_ended_while_connected
+                        log 'heartbeat: result=ended，但本地设备仍连接；保留现场继续监护'
+                        ;;
+                    result=error)
+                        heartbeat_last=error
+                        [[ $sticky_fault != none && $sticky_fault != unknown ]] || sticky_fault=heartbeat_error
+                        log 'heartbeat: result=error；会话关联可能异常，保留现场继续监护'
+                        ;;
+                    *)
+                        heartbeat_last=unexpected
+                        [[ $sticky_fault != none && $sticky_fault != unknown ]] || sticky_fault=heartbeat_unexpected
+                        log "heartbeat: $reply；回复语义异常，保留现场继续监护"
+                        ;;
+                esac
+            else
+                channel=unreachable
+                heartbeat_last=unavailable
+                log 'heartbeat 控制通道无有效回复；保留连接，不执行 detach'
+            fi
+            # 未能拿锁只意味着 disconnect 可能正在进行；不能让旧心跳覆盖已关闭的轮次。
+            if ! commit_health_if_running; then
+                log '心跳观测写入未取得短锁，保留旧记录供检查'
+            fi
+        fi
+        sleep 1
+        ((count+=1))
+    done
+fi
+
+# systemd 初版：在原生 nbd@ 停止后，只在确认设备归零时发送 close。
+# 不执行 detach；等关机顺序实测后再引入三次有限补做。
+load_state || die '没有可供交接的 session 状态'
+[[ ${saved[boot]} == "$boot_id" && ${saved[client]} == "$client_id" && \
+   ${saved[host]} == "$data_host" && ${saved[port]} == "$data_port" && \
+   ${saved[export]} == "$data_export" ]] || die '状态与当前配置不匹配'
+session=${saved[session]}
+load_health
+if [[ ${saved[phase]} == closed ]]; then
+    log "session=$session 本地已标记 closed；不执行第二次收尾"
+    exit 0
+fi
+active_state=$($systemctl_bin show --value -p ActiveState "nbd@$dev.service") || die '无法检查原生 NBD 单元状态'
+[[ $active_state == inactive || $active_state == failed ]] || die "原生 NBD 单元仍为 $active_state；必须先完成原生 stop"
+start=$SECONDS
+if [[ $(device_status) != disconnected ]]; then
+    log '原生 NBD 已停止，但尚未确认设备归零；进入有限补做检查'
+    rescue_detach "$start" || die "设备仍未安全解除；状态=$(device_status)，拒绝发送 zero=yes"
+fi
+[[ $(device_status) == disconnected ]] || die '设备状态不是 disconnected，不能发送 zero=yes'
+log "原生 NBD 已停止且设备归零，开始 close: session=$session"
+reply=
+while (( SECONDS - start < 30 )); do
+    remaining=$((30 - (SECONDS - start)))
+    budget=$request_timeout_sec
+    ((budget <= remaining)) || budget=$remaining
+    if reply=$(timeout --signal=TERM --kill-after=1s "${budget}s"         "$0" _wire "$control_host" "$control_port"         'op=close' "session=$session" 'zero=yes'); then
+        log "close: $reply"
+        case $reply in
+            result=complete|result=abnormal)
+                save_state closed
+                close_result=${reply#result=}
+                [[ $close_result != abnormal || ( $sticky_fault != none && $sticky_fault != unknown ) ]] || sticky_fault=server_close_abnormal
+                save_health
+                log "结束结果=$reply；本地标记 closed（不表示文件系统一致性）"
+                # 控制层已确认关闭，退出码 0 表示本地清理动作完成；异常事实留在状态、journal 和服务端。
+                exit 0
+                ;;
+            result=wait) ;;
+            *) die "收尾回复不符合预期：$reply"
+        esac
+    else
+        log 'close 无有效回复，继续有限重试'
+    fi
+    (( SECONDS - start + 1 < 30 )) || break
+    sleep 1
+done
+die '30 秒内未能取得本轮服务端结束确认；本地 session 原样保留'

@@ -1,0 +1,13 @@
+# Local build outputs and runtime evidence
+/dist/
+/build/
+*.qcow2
+*.qcow2.*
+*.img
+*.log
+*.state
+*.tmp
+*.swp
+*~
+.env
+.env.local

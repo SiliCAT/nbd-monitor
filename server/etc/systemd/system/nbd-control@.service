@@ -1,0 +1,27 @@
+[Unit]
+Description=NBD control request %i
+After=network.target
+CollectMode=inactive-or-failed
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+
+ExecStart=/usr/local/libexec/nbd-server request
+
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+RuntimeMaxSec=5s
+TimeoutStopSec=1s
+KillMode=control-group
+Restart=no
+
+RuntimeDirectory=nbd-server
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=nbd-server
+StateDirectoryMode=0700

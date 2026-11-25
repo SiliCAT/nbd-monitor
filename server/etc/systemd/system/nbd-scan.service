@@ -1,0 +1,25 @@
+[Unit]
+Description=NBD session timeout scan
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+
+ExecStart=/usr/local/libexec/nbd-server scan
+
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+TimeoutStartSec=10min
+TimeoutStopSec=10s
+KillMode=control-group
+
+RuntimeDirectory=nbd-server
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StateDirectory=nbd-server
+StateDirectoryMode=0700

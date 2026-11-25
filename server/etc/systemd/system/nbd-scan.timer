@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic NBD session timeout scan
+
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+Unit=nbd-scan.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,825 @@
+#!/bin/bash
+# NBD 服务端初版：纯 Bash 业务脚本；不定义函数，不 source 状态或配置。
+# 入口：request | export PORT | finish PORT | scan
+# 配套六个单元文件见此前 nbd-server-systemd.tar.gz。
+# 依赖：Bash >= 4.3、flock、timeout、sha256sum、mkdir、mv、sleep、systemctl，
+#       以及 qemu-nbd、qemu-img。默认以 root 运行。
+#
+# 配置：/etc/nbd-server.conf，INI 格式，[global] 与 [数据端口]。
+# 必填：各端口段 image=/绝对路径；export 可为空。
+# 默认：register_timeout_sec=30 heartbeat_timeout_sec=30 closing_timeout_sec=45
+#       maintenance_timeout_sec=120 reset_on_timeout=no write_mode=keep
+#       read_only=no snapshot_keep=0
+# 可选透传：qemu.cache、qemu.aio、qemu.discard、qemu.detect-zeroes。
+# 每项配置值按一个参数传递，不执行 Shell 展开；不接受任意附加命令。
+#
+# 消息：逐行 key=value，以 END 结束；回复仅一行 result=VALUE。
+# previous：client host port export
+# register：client host port export session
+# heartbeat：session
+# close：session zero=yes|no|unknown
+# 本脚本不认证、不执行 umount/swapoff、不操作客户端设备。
+#
+# 状态：/var/lib/nbd-server，锁与临时输出：/run/nbd-server。
+# 所有结果使用临时文件+同目录 rename 保存；不承诺掉电事务原子性。
+# session 与 client 只作数据，路径索引用 SHA-256，不执行其内容。
+# 自动快照名字：nbd-auto-<20位创建时间>-<32位本轮运行标识>。
+# 正常结果与快照结果分别保存；snapshot_keep=0 不清理已有快照。
+#
+# 可覆盖环境变量供隔离测试/特殊部署使用（不能来自网络消息）：
+# NBD_SERVER_CONFIG、NBD_SERVER_STATE_DIR、NBD_SERVER_RUN_DIR、
+# NBD_SERVER_QEMU_NBD、NBD_SERVER_QEMU_IMG、NBD_SERVER_SYSTEMCTL。
+# export/finish 要求 systemd 提供 INVOCATION_ID；export 必须经 socket 激活。
+# finish 读取 SERVICE_RESULT、EXIT_CODE、EXIT_STATUS，不凭零退出码证明 DISC。
+
+set -u
+set -o pipefail
+umask 077
+export LC_ALL=C
+shopt -s nullglob
+
+mode=${1:-}
+if [[ $mode == --help || $mode == -h || -z $mode ]]; then
+    printf '%s\n' \
+        '用法：nbd-server request | export PORT | finish PORT | scan' \
+        '配置：/etc/nbd-server.conf；四种控制消息及可选参数见脚本开头注释。' \
+        'export/finish 由配套 systemd 数据服务调用，不直接运行 qemu-nbd 后台进程。'
+    [[ -n $mode ]] && exit 0
+    exit 2
+fi
+case $mode in request|export|finish|scan) ;; *) printf '未知入口：%s\n' "$mode" >&2; exit 2 ;; esac
+if (( EUID != 0 )); then
+    printf '本脚本需要 root 身份运行。\n' >&2
+    [[ $mode != request ]] || printf 'result=error\n'
+    exit 1
+fi
+
+config_file=${NBD_SERVER_CONFIG:-/etc/nbd-server.conf}
+state_dir=${NBD_SERVER_STATE_DIR:-/var/lib/nbd-server}
+runtime_dir=${NBD_SERVER_RUN_DIR:-/run/nbd-server}
+qemu_nbd=${NBD_SERVER_QEMU_NBD:-qemu-nbd}
+qemu_img=${NBD_SERVER_QEMU_IMG:-qemu-img}
+systemctl_bin=${NBD_SERVER_SYSTEMCTL:-systemctl}
+for directory in "$state_dir" "$runtime_dir"; do
+    if [[ $directory != /* ]]; then
+        printf '状态目录必须是绝对路径：%s\n' "$directory" >&2
+        [[ $mode != request ]] || printf 'result=error\n'
+        exit 1
+    fi
+done
+if ! mkdir -p -- "$state_dir/resources" "$state_dir/sessions" "$state_dir/previous" "$runtime_dir"; then
+    [[ $mode != request ]] || printf 'result=error\n'
+    exit 1
+fi
+if ! IFS= read -r server_boot < /proc/sys/kernel/random/boot_id; then
+    printf '无法读取本机启动标识。\n' >&2
+    [[ $mode != request ]] || printf 'result=error\n'
+    exit 1
+fi
+
+# [01] 读取控制消息。整帧最多 16 KiB、32 字段、单行 4096 字节，读取预算 3 秒。
+declare -A message=()
+op=
+if [[ $mode == request ]]; then
+    read -r uptime_value _ < /proc/uptime
+    read_deadline=$(( ${uptime_value%%.*} + 3 ))
+    message_bytes=0
+    message_fields=0
+    message_ok=no
+    while :; do
+        read -r uptime_value _ < /proc/uptime
+        read_remaining=$(( read_deadline - ${uptime_value%%.*} ))
+        (( read_remaining > 0 )) || break
+        line=
+        IFS= read -r -t "$read_remaining" -n 4097 line || break
+        message_bytes=$((message_bytes + ${#line} + 1))
+        (( ${#line} <= 4096 && message_bytes <= 16384 )) || break
+        [[ $line != *$'\r'* ]] || break
+        if [[ $line == END ]]; then message_ok=yes; break; fi
+        [[ $line == *=* ]] || break
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in op|client|host|port|export|session|zero) ;; *) break ;; esac
+        [[ ! ${message[$key]+present} ]] || break
+        message[$key]=$value
+        ((message_fields += 1))
+        (( message_fields <= 32 )) || break
+    done
+    op=${message[op]-}
+    case $op in
+        previous) required=(client host port export) ;;
+        register) required=(client host port export session) ;;
+        heartbeat) required=(session) ;;
+        close) required=(session zero) ;;
+        *) message_ok=no; required=() ;;
+    esac
+    for key in "${required[@]}"; do
+        [[ ${message[$key]+present} ]] || message_ok=no
+        [[ $key == export || -n ${message[$key]-} ]] || message_ok=no
+    done
+    if [[ $op == close ]]; then
+        case ${message[zero]-} in yes|no|unknown) ;; *) message_ok=no ;; esac
+    fi
+    if [[ $message_ok != yes ]]; then
+        printf '控制请求不完整、字段不符或读取超时。\n' >&2
+        printf 'result=error\n'
+        exit 0
+    fi
+fi
+
+# [02] 解析配置；heartbeat/close/finish/scan 使用本轮配置，不依赖当前配置文件。
+declare -A config=()
+config[global\|register_timeout_sec]=30
+config[global\|heartbeat_timeout_sec]=30
+config[global\|closing_timeout_sec]=45
+config[global\|maintenance_timeout_sec]=120
+config[global\|reset_on_timeout]=no
+config[global\|write_mode]=keep
+config[global\|read_only]=no
+config[global\|snapshot_keep]=0
+declare -A configured_ports=()
+config_ok=yes
+if [[ $mode == export || ( $mode == request && ( $op == previous || $op == register ) ) ]]; then
+    if [[ ! -r $config_file ]]; then
+        printf '无法读取配置：%s\n' "$config_file" >&2
+        config_ok=no
+    else
+        section=
+        line_number=0
+        declare -A config_seen=()
+        while IFS= read -r line || [[ -n $line ]]; do
+            ((line_number += 1))
+            if [[ $line == *$'\r'* ]]; then config_ok=no; break; fi
+            line=${line#"${line%%[!$' \t']*}"}
+            line=${line%"${line##*[!$' \t']}"}
+            [[ -n $line && $line != \#* ]] || continue
+            if [[ $line == \[*\] ]]; then
+                section=${line:1:${#line}-2}
+                if [[ $section != global ]]; then
+                    if [[ ! $section =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$section > 65535)); then config_ok=no; break; fi
+                    configured_ports[$section]=yes
+                fi
+                if [[ ${config_seen[section\|$section]+present} ]]; then config_ok=no; break; fi
+                config_seen[section\|$section]=yes
+                continue
+            fi
+            if [[ -z $section || $line != *=* ]]; then config_ok=no; break; fi
+            key=${line%%=*}; value=${line#*=}
+            key=${key#"${key%%[!$' \t']*}"}; key=${key%"${key##*[!$' \t']}"}
+            value=${value#"${value%%[!$' \t']*}"}; value=${value%"${value##*[!$' \t']}"}
+            case $key in
+                image|export|register_timeout_sec|heartbeat_timeout_sec|closing_timeout_sec|maintenance_timeout_sec|reset_on_timeout|write_mode|read_only|snapshot_keep|qemu.cache|qemu.aio|qemu.discard|qemu.detect-zeroes) ;;
+                *) config_ok=no; break ;;
+            esac
+            if [[ ${config_seen[$section\|$key]+present} ]]; then config_ok=no; break; fi
+            config_seen[$section\|$key]=yes
+            config[$section\|$key]=$value
+        done < "$config_file"
+        [[ $config_ok == yes ]] || printf '配置第 %s 行不符合 INI 约定。\n' "$line_number" >&2
+    fi
+fi
+
+# [03] 解析目标与索引。索引只保存端口、本轮运行标识，客户端内容不作路径。
+port=
+run_id=
+session_index=
+previous_index=
+known_session=no
+if [[ $mode == export || $mode == finish ]]; then
+    port=${2:-}
+elif [[ $mode == request && ( $op == previous || $op == register ) ]]; then
+    port=${message[port]}
+fi
+if [[ -n $port ]]; then
+    if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$port > 65535)); then
+        printf '数据端口无效：%s\n' "$port" >&2
+        [[ $mode != request ]] || printf 'result=error\n'
+        exit 1
+    fi
+fi
+if [[ $mode == request && ( $op == register || $op == heartbeat || $op == close ) ]]; then
+    hash_text=$(printf '%s' "${message[session]}" | sha256sum) || exit 1
+    session_index=$state_dir/sessions/${hash_text%% *}
+    if [[ -f $session_index ]]; then
+        { IFS= read -r index_port; IFS= read -r index_run; } < "$session_index"
+        if [[ $index_port =~ ^[1-9][0-9]{0,4}$ && $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then
+            if [[ $op != register || $port == "$index_port" ]]; then
+                port=$index_port; run_id=$index_run; known_session=yes
+            else
+                printf '登记 session 与原数据端口冲突。\n' >&2
+                printf 'result=error\n'; exit 0
+            fi
+        else
+            printf '会话索引损坏。\n' >&2
+            printf 'result=error\n'; exit 0
+        fi
+    elif [[ $op != register ]]; then
+        printf '未找到对应会话。\n' >&2
+        printf 'result=error\n'; exit 0
+    fi
+fi
+if [[ $mode == request && ( $op == previous || $op == register ) ]]; then
+    if [[ $known_session != yes && ( $config_ok != yes || ! ${configured_ports[$port]+present} ) ]]; then
+        printf '配置中没有可用的数据入口：%s\n' "$port" >&2
+        printf 'result=error\n'; exit 0
+    fi
+    # 已登记重试使用原运行记录；新登记/previous 核对当前实际配置。
+    if [[ $known_session != yes && ${message[export]} != "${config[$port\|export]-}" ]]; then
+        printf '数据端口 %s 的导出名不匹配。\n' "$port" >&2
+        printf 'result=error\n'; exit 0
+    fi
+    hash_text=$(printf '%s\n' "${message[client]}" "${message[host]}" "$port" "${message[export]}" | sha256sum) || exit 1
+    previous_index=$state_dir/previous/${hash_text%% *}
+    if [[ $op == previous ]]; then
+        if [[ ! -f $previous_index ]]; then printf 'result=none\n'; exit 0; fi
+        { IFS= read -r index_port; IFS= read -r index_run; } < "$previous_index"
+        if [[ $index_port != "$port" || ! $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then
+            printf '历史索引损坏。\n' >&2
+            printf 'result=error\n'; exit 0
+        fi
+        run_id=$index_run
+    fi
+fi
+
+if [[ $mode == export || $mode == finish ]]; then
+    run_id=${INVOCATION_ID:-}
+    if [[ ! $run_id =~ ^[a-fA-F0-9]{32}$ ]]; then
+        printf '%s 入口缺少 systemd INVOCATION_ID。\n' "$mode" >&2
+        exit 1
+    fi
+fi
+if [[ $mode == export ]]; then
+    if [[ $config_ok != yes || ! ${configured_ports[$port]+present} ]]; then printf '没有端口 %s 的有效资源配置。\n' "$port" >&2; exit 1; fi
+    if [[ ${LISTEN_PID:-} != "$$" || ${LISTEN_FDS:-} != 1 ]]; then
+        printf 'export 必须接收 systemd 传入的一个监听 socket。\n' >&2; exit 1
+    fi
+    command -v "$qemu_nbd" >/dev/null 2>&1 || { printf '找不到 qemu-nbd：%s\n' "$qemu_nbd" >&2; exit 1; }
+    declare -A effective=()
+    for key in register_timeout_sec heartbeat_timeout_sec closing_timeout_sec maintenance_timeout_sec reset_on_timeout write_mode read_only snapshot_keep qemu.cache qemu.aio qemu.discard qemu.detect-zeroes; do
+        effective[$key]=${config[$port\|$key]-${config[global\|$key]-}}
+    done
+    effective[image]=${config[$port\|image]-}
+    effective[export]=${config[$port\|export]-}
+    if [[ ${effective[image]} != /* ]]; then printf '端口 %s 必须配置绝对镜像路径。\n' "$port" >&2; exit 1; fi
+    for key in register_timeout_sec heartbeat_timeout_sec closing_timeout_sec maintenance_timeout_sec snapshot_keep; do
+        value=${effective[$key]}
+        if [[ ! $value =~ ^(0|[1-9][0-9]{0,8})$ ]] || [[ $key != snapshot_keep && $value == 0 ]]; then
+            printf '配置 %s 必须是可用的整数秒数/数量：%s\n' "$key" "$value" >&2; exit 1
+        fi
+    done
+    case ${effective[reset_on_timeout]} in yes|no) ;; *) printf 'reset_on_timeout 只接受 yes/no。\n' >&2; exit 1 ;; esac
+    case ${effective[read_only]} in yes|no) ;; *) printf 'read_only 只接受 yes/no。\n' >&2; exit 1 ;; esac
+    case ${effective[write_mode]} in keep|temporary) ;; *) printf 'write_mode 只接受 keep/temporary。\n' >&2; exit 1 ;; esac
+fi
+
+# [04] scan 使用独立执行锁；登记使用索引锁，且始终先索引锁、后资源锁。
+if [[ $mode == scan ]]; then
+    exec {scan_fd}> "$runtime_dir/scan.lock" || exit 1
+    flock -n "$scan_fd" || exit 0
+fi
+if [[ $mode == request && $op == register ]]; then
+    exec {session_fd}> "$runtime_dir/session.lock" || { printf 'result=error\n'; exit 0; }
+    if ! flock -w 1 "$session_fd"; then printf 'result=error\n'; exit 0; fi
+    # 在索引锁下重查，覆盖并发的首次登记。
+    if [[ -f $session_index && $known_session != yes ]]; then
+        { IFS= read -r index_port; IFS= read -r index_run; } < "$session_index"
+        if [[ $index_port != "$port" || ! $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then printf 'result=error\n'; exit 0; fi
+        run_id=$index_run; known_session=yes
+    fi
+fi
+
+work_ports=()
+if [[ $mode == scan ]]; then
+    for current_file in "$state_dir"/resources/*/current; do
+        resource_path=${current_file%/current}
+        candidate_port=${resource_path##*/}
+        [[ $candidate_port =~ ^[1-9][0-9]{0,4}$ ]] && work_ports+=("$candidate_port")
+    done
+else
+    work_ports=("$port")
+fi
+overall_rc=0
+
+# [05] 所有入口共用资源状态读写骨架；等待和外部动作在释放资源锁之后进行。
+for port in "${work_ports[@]}"; do
+    resource_dir=$state_dir/resources/$port
+    if ! mkdir -p -- "$resource_dir/runs"; then
+        [[ $mode != request ]] || printf 'result=error\n'
+        exit 1
+    fi
+    work_again=yes
+    finish_recorded=no
+    while [[ $work_again == yes ]]; do
+        work_again=no
+        result=error
+        changed=no
+        post_action=
+        reply_after_write=no
+        exec {resource_fd}> "$runtime_dir/port-$port.lock" || exit 1
+        if ! flock -w 1 "$resource_fd"; then
+            exec {resource_fd}>&-
+            if [[ $mode == request ]]; then printf 'result=error\n'; exit 0; fi
+            if [[ $mode == finish ]]; then sleep 1; work_again=yes; continue; fi
+            overall_rc=1; break
+        fi
+        current_run=
+        if [[ -f $resource_dir/current ]]; then IFS= read -r current_run < "$resource_dir/current" || true; fi
+        if [[ $mode == scan || ( $mode == request && $op == register && $known_session != yes ) ]]; then
+            run_id=$current_run
+        fi
+        if [[ ! $run_id =~ ^[a-fA-F0-9]{32}$ ]]; then
+            exec {resource_fd}>&-
+            if [[ $mode == request ]]; then
+                [[ $op != register ]] || result=wait
+                printf 'result=%s\n' "$result"; exit 0
+            fi
+            printf '端口 %s 缺少本轮运行标识。\n' "$port" >&2
+            overall_rc=1; break
+        fi
+        read -r uptime_value _ < /proc/uptime
+        now_tick=${uptime_value%%.*}
+        printf -v now_epoch '%(%s)T' -1
+        state_file=$resource_dir/runs/$run_id.state
+        declare -A state=()
+        if [[ -f $state_file ]]; then
+            while IFS= read -r state_line || [[ -n $state_line ]]; do
+                [[ $state_line == *=* ]] || continue
+                state[${state_line%%=*}]=${state_line#*=}
+            done < "$state_file"
+        fi
+
+        # [06] export 建立本轮；若上轮退出钩子被中断，留异常记录而不补做快照。
+        if [[ $mode == export ]]; then
+            if [[ $current_run =~ ^[a-fA-F0-9]{32}$ && -f $resource_dir/runs/$current_run.state ]]; then
+                declare -A old=()
+                while IFS= read -r state_line || [[ -n $state_line ]]; do
+                    [[ $state_line == *=* ]] || continue
+                    old[${state_line%%=*}]=${state_line#*=}
+                done < "$resource_dir/runs/$current_run.state"
+                old_alive=no
+                if [[ ${old[boot]-} == "$server_boot" && ${old[pid]-} =~ ^[0-9]+$ && -r /proc/${old[pid]}/stat ]]; then
+                    proc_line=
+                    IFS= read -r proc_line 2>/dev/null < "/proc/${old[pid]}/stat" || proc_line=
+                    read -r -a proc_fields <<< "${proc_line##*) }"
+                    [[ ${proc_fields[19]-} == "${old[pid_start]-}" && ${proc_fields[0]-} != Z ]] && old_alive=yes
+                fi
+                maintenance_alive=no
+                if [[ ${old[boot]-} == "$server_boot" && ${old[maintenance_pid]-} =~ ^[0-9]+$ && -r /proc/${old[maintenance_pid]}/stat ]]; then
+                    proc_line=
+                    IFS= read -r proc_line 2>/dev/null < "/proc/${old[maintenance_pid]}/stat" || proc_line=
+                    read -r -a proc_fields <<< "${proc_line##*) }"
+                    [[ ${proc_fields[19]-} == "${old[maintenance_pid_start]-}" && ${proc_fields[0]-} != Z ]] && maintenance_alive=yes
+                fi
+                if [[ $old_alive == yes || $maintenance_alive == yes || ( ${old[boot]-} == "$server_boot" && ${old[reset_result]-} == running ) ]]; then
+                    printf '端口 %s 的前一轮仍占用资源，不启动新导出。\n' "$port" >&2
+                    exec {resource_fd}>&-; exit 1
+                fi
+                if [[ ${old[phase]-} != finished || ${old[maintenance]-} == running || ${old[maintenance]-} == pending ]]; then
+                    [[ -n ${old[fault]-} ]] || old[fault]=previous_processing_interrupted
+                    [[ ${old[exit_result]-} == complete ]] || old[exit_result]=incomplete
+                    old[phase]=finished
+                    old[process]=exited
+                    [[ ${old[maintenance]-} == done || ${old[maintenance]-} == skipped ]] || old[maintenance]=failed
+                    [[ ${old[reset_result]-} != running ]] || old[reset_result]=failed
+                    state_lines=()
+                    for key in "${!old[@]}"; do state_lines+=("$key=${old[$key]}"); done
+                    old_file=$resource_dir/runs/$current_run.state
+                    if ! printf '%s\n' "${state_lines[@]}" > "$old_file.tmp.$$" || ! mv -f -- "$old_file.tmp.$$" "$old_file"; then
+                        printf '保存上一轮中断结果失败。\n' >&2; exec {resource_fd}>&-; exit 1
+                    fi
+                fi
+            fi
+            state=()
+            for key in "${!effective[@]}"; do state[$key]=${effective[$key]}; done
+            state[run]=$run_id
+            state[port]=$port
+            state[boot]=$server_boot
+            IFS= read -r proc_line < /proc/self/stat
+            # 内建 read 直接读取当前进程；使用该 proc 视图中的 PID，兼容 PID 命名空间。
+            state[pid]=${proc_line%% *}
+            read -r -a proc_fields <<< "${proc_line##*) }"
+            state[pid_start]=${proc_fields[19]}
+            state[start_tick]=$now_tick
+            state[start_epoch]=$now_epoch
+            state[last_tick]=$now_tick
+            state[phase]=awaiting
+            state[process]=running
+            state[session]=
+            state[client]=
+            state[host]=
+            state[zero]=unknown
+            state[close_seen]=no
+            state[closing_deadline]=0
+            state[exit_result]=pending
+            state[fault]=
+            state[reset_result]=none
+            state[maintenance]=none
+            changed=yes
+            post_action=exec_export
+        elif [[ ${state[run]-} != "$run_id" || ${state[port]-} != "$port" ]]; then
+            printf '端口 %s 的运行记录不存在或不一致。\n' "$port" >&2
+            exec {resource_fd}>&-
+            if [[ $mode == request ]]; then printf 'result=error\n'; exit 0; fi
+            overall_rc=1; break
+        fi
+
+        # [07] 观察的是本轮 PID+启动时刻；不把复用 PID 或下一轮当成本轮。
+        alive=no
+        if [[ ${state[boot]-} == "$server_boot" && ${state[pid]-} =~ ^[0-9]+$ && -r /proc/${state[pid]}/stat ]]; then
+            proc_line=
+            IFS= read -r proc_line 2>/dev/null < "/proc/${state[pid]}/stat" || proc_line=
+            read -r -a proc_fields <<< "${proc_line##*) }"
+            [[ ${proc_fields[19]-} == "${state[pid_start]-}" && ${proc_fields[0]-} != Z ]] && alive=yes
+        fi
+        if [[ $mode != export && ${state[boot]-} != "$server_boot" && ( ${state[phase]-} != finished || ${state[maintenance]-} == running || ${state[maintenance]-} == pending ) ]]; then
+            [[ -n ${state[fault]-} ]] || state[fault]=server_restarted
+            [[ ${state[exit_result]-} != pending ]] || state[exit_result]=incomplete
+            state[phase]=finished
+            state[process]=exited
+            [[ ${state[maintenance]-} != running && ${state[maintenance]-} != pending ]] || state[maintenance]=failed
+            [[ ${state[reset_result]-} != running ]] || state[reset_result]=failed
+            changed=yes
+        fi
+
+        if [[ $mode == request ]]; then
+            case $op in
+                previous)
+                    if [[ ${state[client]-} != "${message[client]}" || ${state[host]-} != "${message[host]}" || ${state[export]-} != "${message[export]}" ]]; then
+                        result=error
+                    elif [[ -n ${state[fault]-} || ${state[maintenance]-} == failed ]]; then
+                        result=abnormal
+                    elif [[ ${state[exit_result]-} == complete ]]; then result=complete
+                    else result=incomplete
+                    fi
+                    ;;
+                register)
+                    if [[ -n ${state[session]-} ]]; then
+                        if [[ ${state[session]} == "${message[session]}" && ${state[client]} == "${message[client]}" && ${state[host]} == "${message[host]}" && ${state[export]} == "${message[export]}" ]]; then
+                            result=ok; reply_after_write=yes
+                        else result=error
+                        fi
+                    elif [[ ${state[phase]-} == finished || ${state[reset_result]-} == running ]]; then result=wait
+                    elif [[ ${state[export]-} != "${message[export]}" ]]; then result=error
+                    else
+                        state[session]=${message[session]}
+                        state[client]=${message[client]}
+                        state[host]=${message[host]}
+                        state[registered_epoch]=$now_epoch
+                        state[last_tick]=$now_tick
+                        [[ ${state[phase]} != awaiting ]] || state[phase]=active
+                        changed=yes; result=ok; reply_after_write=yes
+                        printf '端口 %s 已关联本轮客户端 %s。\n' "$port" "${message[client]}" >&2
+                    fi
+                    ;;
+                heartbeat|close)
+                    if [[ ${state[session]-} != "${message[session]}" ]]; then result=error
+                    elif [[ $op == heartbeat ]]; then
+                        if [[ -n ${state[fault]-} || ${state[exit_result]-} == abnormal || ${state[exit_result]-} == incomplete ]]; then
+                            result=abnormal
+                        elif [[ ${state[process]-} == exited || ${state[phase]-} == finished || $alive == no ]]; then result=ended
+                        else result=ok
+                        fi
+                        if [[ ${state[phase]-} != finished && ${state[reset_result]-} != running ]]; then
+                            if [[ ${state[phase]-} == preserved && ${state[close_seen]-} != yes ]]; then
+                                state[phase]=active
+                                printf '端口 %s 的客户端心跳恢复；既有异常记录保留。\n' "$port" >&2
+                            fi
+                            state[last_tick]=$now_tick
+                            changed=yes
+                        fi
+                    else
+                        state[zero]=${message[zero]}
+                        state[close_seen]=yes
+                        if [[ ${state[phase]-} != finished ]]; then
+                            [[ ${state[reset_result]-} == running ]] || state[phase]=closing
+                            if (( ${state[closing_deadline]:-0} == 0 )); then
+                                state[closing_deadline]=$((now_tick + state[closing_timeout_sec]))
+                                state[closing_epoch]=$now_epoch
+                            fi
+                        fi
+                        changed=yes
+                        if [[ ${state[phase]-} != finished ]] && (( ${state[closing_deadline]:-0} > 0 && now_tick >= state[closing_deadline] )); then
+                            [[ -n ${state[fault]-} ]] || state[fault]=closing_timeout
+                            state[exit_result]=incomplete
+                        fi
+                        if [[ ${state[zero]} == yes && ${state[process]-} == exited ]]; then
+                            if [[ ${state[exit_result]-} == complete ]]; then result=complete
+                            elif [[ -n ${state[fault]-} || ${state[exit_result]-} == abnormal || ${state[exit_result]-} == incomplete ]]; then result=abnormal
+                            elif [[ ${state[exit_kind]-} == unforced ]]; then
+                                state[exit_result]=complete; state[phase]=finished; state[completed_epoch]=$now_epoch; result=complete
+                                printf '端口 %s 的本轮协商收尾完成。\n' "$port" >&2
+                            else result=abnormal
+                            fi
+                        else result=wait
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+
+        # [08] finish：首先保存退出事实；然后有限等待 close，再选择维护。
+        if [[ $mode == finish ]]; then
+            if [[ $current_run != "$run_id" ]]; then
+                printf '端口 %s 的 finish 已不是当前轮，不操作镜像。\n' "$port" >&2
+                exec {resource_fd}>&-; overall_rc=1; break
+            fi
+            if [[ $finish_recorded != yes && ${state[process]-} != exited ]]; then
+                if [[ $alive == yes ]]; then
+                    printf '端口 %s 的本轮主进程尚未退出，拒绝 finish。\n' "$port" >&2
+                    exec {resource_fd}>&-; overall_rc=1; break
+                fi
+                state[process]=exited
+                state[exit_epoch]=$now_epoch
+                state[service_result]=${SERVICE_RESULT:-unknown}
+                state[exit_code]=${EXIT_CODE:-unknown}
+                state[exit_status]=${EXIT_STATUS:-unknown}
+                if [[ ${SERVICE_RESULT:-} == success && ${EXIT_CODE:-} == exited && ${EXIT_STATUS:-} == 0 && -z ${state[fault]-} ]]; then
+                    state[exit_kind]=unforced
+                else
+                    state[exit_kind]=abnormal
+                    [[ -n ${state[fault]-} ]] || state[fault]=export_exit_abnormal
+                fi
+                changed=yes
+                printf '端口 %s 的 qemu-nbd 已退出：%s/%s/%s。\n' "$port" "${state[service_result]}" "${state[exit_code]}" "${state[exit_status]}" >&2
+            fi
+            finish_recorded=yes
+            if [[ -n ${state[fault]-} || ${state[exit_result]-} == incomplete || ${state[exit_result]-} == abnormal ]]; then
+                [[ ${state[exit_result]-} == incomplete ]] || state[exit_result]=abnormal
+                state[phase]=finished
+                [[ ${state[maintenance]-} != none ]] || state[maintenance]=skipped
+                changed=yes
+            elif [[ ${state[exit_result]-} != complete ]]; then
+                if (( ${state[closing_deadline]:-0} == 0 )); then
+                    state[closing_deadline]=$((now_tick + state[closing_timeout_sec]))
+                    state[closing_epoch]=$now_epoch
+                fi
+                state[phase]=closing
+                if (( now_tick >= state[closing_deadline] )); then
+                    state[exit_result]=incomplete; state[phase]=finished; state[fault]=closing_timeout
+                    state[maintenance]=skipped
+                    printf '端口 %s 的进程已退出，但客户端交接超时。\n' "$port" >&2
+                elif [[ ${state[close_seen]-} == yes && ${state[zero]-} == yes && -n ${state[session]-} && ${state[exit_kind]-} == unforced ]]; then
+                    state[exit_result]=complete; state[phase]=finished; state[completed_epoch]=$now_epoch
+                    printf '端口 %s 的本轮协商收尾完成。\n' "$port" >&2
+                else post_action=finish_wait
+                fi
+                changed=yes
+            fi
+            if [[ ${state[exit_result]-} == complete ]]; then
+                if [[ ${state[write_mode]} == keep && ${state[read_only]} == no ]] && ((state[snapshot_keep] > 0)); then
+                    case ${state[maintenance]-} in
+                        none|pending)
+                            state[maintenance]=running
+                            IFS= read -r proc_line < /proc/self/stat
+                            state[maintenance_pid]=${proc_line%% *}
+                            read -r -a proc_fields <<< "${proc_line##*) }"
+                            state[maintenance_pid_start]=${proc_fields[19]}
+                            state[maintenance_deadline]=$((now_tick + state[maintenance_timeout_sec]))
+                            printf -v snapshot_epoch '%020d' "$now_epoch"
+                            state[snapshot_name]=nbd-auto-$snapshot_epoch-$run_id
+                            changed=yes; post_action=maintenance
+                            ;;
+                        running)
+                            printf '端口 %s 已有维护执行记录，不重复执行。\n' "$port" >&2
+                            ;;
+                    esac
+                elif [[ ${state[maintenance]-} == none ]]; then state[maintenance]=skipped; changed=yes
+                fi
+            fi
+        fi
+
+        # [09] scan：先看收尾期限，再看登记/心跳；每轮最多一次自动重置。
+        if [[ $mode == scan && ${state[phase]-} != finished ]]; then
+            timeout_reason=
+            if (( ${state[closing_deadline]:-0} > 0 )); then
+                (( now_tick < state[closing_deadline] )) || timeout_reason=closing_timeout
+            elif [[ -z ${state[session]-} ]]; then
+                (( now_tick - state[start_tick] < state[register_timeout_sec] )) || timeout_reason=registration_timeout
+            else
+                (( now_tick - state[last_tick] < state[heartbeat_timeout_sec] )) || timeout_reason=heartbeat_timeout
+            fi
+            if [[ -n $timeout_reason ]]; then
+                [[ -n ${state[fault]-} ]] || state[fault]=$timeout_reason
+                if [[ $timeout_reason == closing_timeout ]]; then state[exit_result]=incomplete; fi
+                if [[ $alive == no || ${state[process]-} == exited ]]; then
+                    # 旧进程已不在：不停止/重启可能属于下一阶段的入口，退出钩子负责收口。
+                    if [[ ${state[scan_dead_logged]-} != yes ]]; then
+                        printf '端口 %s：%s；旧进程已不在，不执行重置。\n' "$port" "$timeout_reason" >&2
+                        state[scan_dead_logged]=yes
+                    fi
+                    changed=yes
+                elif [[ ${state[reset_result]-} == none ]]; then
+                    state[timeout_epoch]=$now_epoch
+                    if [[ ${state[reset_on_timeout]} == yes ]]; then
+                        state[phase]=resetting; state[reset_result]=running; post_action=reset
+                        printf '端口 %s：%s，开始一次受控重置。\n' "$port" "$timeout_reason" >&2
+                    else
+                        state[phase]=preserved; state[reset_result]=preserved
+                        printf '端口 %s：%s，按配置保留现场。\n' "$port" "$timeout_reason" >&2
+                    fi
+                    changed=yes
+                fi
+            fi
+        fi
+
+        # [10] 原子保存本轮状态。不会执行配置/状态文件中的任何内容。
+        if [[ $changed == yes ]]; then
+            state_lines=()
+            for key in "${!state[@]}"; do state_lines+=("$key=${state[$key]}"); done
+            if ! printf '%s\n' "${state_lines[@]}" > "$state_file.tmp.$$" || ! mv -f -- "$state_file.tmp.$$" "$state_file"; then
+                printf '保存端口 %s 的本轮状态失败。\n' "$port" >&2
+                exec {resource_fd}>&-
+                [[ $mode != request ]] || printf 'result=error\n'
+                exit 1
+            fi
+        fi
+        if [[ $mode == export ]]; then
+            if ! printf '%s\n' "$run_id" > "$resource_dir/current.tmp.$$" || ! mv -f -- "$resource_dir/current.tmp.$$" "$resource_dir/current"; then
+                printf '保存当前轮指针失败。\n' >&2; exec {resource_fd}>&-; exit 1
+            fi
+        fi
+        if [[ $reply_after_write == yes ]]; then
+            # 状态先落地，再写两个可由重复 register 重建的索引。
+            index_lines=("$port" "$run_id")
+            for index_file in "$session_index" "$previous_index"; do
+                if ! printf '%s\n' "${index_lines[@]}" > "$index_file.tmp.$$" || ! mv -f -- "$index_file.tmp.$$" "$index_file"; then
+                    printf '保存登记索引失败。\n' >&2
+                    exec {resource_fd}>&-; printf 'result=error\n'; exit 1
+                fi
+            done
+        fi
+        exec {resource_fd}>&-
+
+        if [[ $mode == request ]]; then printf 'result=%s\n' "$result"; exit 0; fi
+        if [[ $post_action == exec_export ]]; then
+            qemu_args=(--format=qcow2 --shared=1 "--export-name=${effective[export]}")
+            [[ ${effective[read_only]} != yes ]] || qemu_args+=(--read-only)
+            [[ ${effective[write_mode]} != temporary || ${effective[read_only]} == yes ]] || qemu_args+=(--snapshot)
+            for key in qemu.cache qemu.aio qemu.discard qemu.detect-zeroes; do
+                [[ -z ${effective[$key]} ]] || qemu_args+=("--${key#qemu.}=${effective[$key]}")
+            done
+            printf '端口 %s 启动导出：镜像=%s；导出名=%s；写入方式=%s。\n' "$port" "${effective[image]}" "${effective[export]}" "${effective[write_mode]}" >&2
+            # exec 保持 LISTEN_PID 与监听 FD；没有 --persistent、--fork 或第二套监听参数。
+            exec "$qemu_nbd" "${qemu_args[@]}" "${effective[image]}"
+            printf '无法执行 qemu-nbd。\n' >&2
+            exit 1
+        fi
+        if [[ $post_action == finish_wait ]]; then sleep 1; work_again=yes; continue; fi
+
+        # [11] 正常退出维护：总预算覆盖所有 qemu-img 操作，不持有状态锁。
+        if [[ $post_action == maintenance ]]; then
+            maintenance_ok=yes
+            maintenance_error=
+            snapshot_name=${state[snapshot_name]}
+            snapshot_output=$runtime_dir/snapshot-$run_id.$$.out
+            if ! command -v "$qemu_img" >/dev/null 2>&1; then maintenance_ok=no; maintenance_error=qemu_img_missing; fi
+            read -r uptime_value _ < /proc/uptime
+            remaining=$((state[maintenance_deadline] - ${uptime_value%%.*}))
+            if (( remaining <= 0 )); then maintenance_ok=no; maintenance_error=maintenance_timeout; fi
+            if [[ $maintenance_ok == yes ]]; then
+                if ! timeout --signal=TERM --kill-after=1s "${remaining}s" "$qemu_img" snapshot -l "${state[image]}" > "$snapshot_output"; then
+                    maintenance_ok=no; maintenance_error=snapshot_list_failed
+                fi
+            fi
+            snapshot_exists=no
+            if [[ $maintenance_ok == yes ]]; then
+                while read -r snapshot_id listed_name _; do
+                    [[ $listed_name != "$snapshot_name" ]] || snapshot_exists=yes
+                done < "$snapshot_output"
+            fi
+            if [[ $maintenance_ok == yes && $snapshot_exists != yes ]]; then
+                read -r uptime_value _ < /proc/uptime
+                remaining=$((state[maintenance_deadline] - ${uptime_value%%.*}))
+                if (( remaining <= 0 )); then maintenance_ok=no; maintenance_error=maintenance_timeout
+                elif ! timeout --signal=TERM --kill-after=1s "${remaining}s" "$qemu_img" snapshot -c "$snapshot_name" "${state[image]}"; then
+                    maintenance_ok=no; maintenance_error=snapshot_create_failed
+                fi
+            fi
+            # 创建成功才进入轮换；重新列出并确认本轮名称确实存在。
+            if [[ $maintenance_ok == yes ]]; then
+                read -r uptime_value _ < /proc/uptime
+                remaining=$((state[maintenance_deadline] - ${uptime_value%%.*}))
+                if (( remaining <= 0 )); then maintenance_ok=no; maintenance_error=maintenance_timeout
+                elif ! timeout --signal=TERM --kill-after=1s "${remaining}s" "$qemu_img" snapshot -l "${state[image]}" > "$snapshot_output"; then
+                    maintenance_ok=no; maintenance_error=snapshot_verify_failed
+                fi
+            fi
+            managed_snapshots=()
+            snapshot_exists=no
+            if [[ $maintenance_ok == yes ]]; then
+                while read -r snapshot_id listed_name _; do
+                    [[ $listed_name != "$snapshot_name" ]] || snapshot_exists=yes
+                    [[ $listed_name =~ ^nbd-auto-[0-9]{20}-[a-fA-F0-9]{32}$ ]] && managed_snapshots+=("$listed_name")
+                done < "$snapshot_output"
+                if [[ $snapshot_exists != yes ]]; then maintenance_ok=no; maintenance_error=snapshot_not_found_after_create; fi
+            fi
+            # Bash 内选择最旧名称；不依赖 jq/awk，也不删除其他命名空间。
+            while [[ $maintenance_ok == yes ]] && (( ${#managed_snapshots[@]} > state[snapshot_keep] )); do
+                oldest=${managed_snapshots[0]}
+                for candidate in "${managed_snapshots[@]}"; do [[ $candidate < $oldest ]] && oldest=$candidate; done
+                # 时钟回拨时也保留刚创建的恢复点。
+                if [[ $oldest == "$snapshot_name" ]]; then
+                    oldest=
+                    for candidate in "${managed_snapshots[@]}"; do
+                        [[ $candidate != "$snapshot_name" ]] || continue
+                        [[ -n $oldest && ! $candidate < $oldest ]] || oldest=$candidate
+                    done
+                fi
+                read -r uptime_value _ < /proc/uptime
+                remaining=$((state[maintenance_deadline] - ${uptime_value%%.*}))
+                if (( remaining <= 0 )); then maintenance_ok=no; maintenance_error=maintenance_timeout; break; fi
+                if ! timeout --signal=TERM --kill-after=1s "${remaining}s" "$qemu_img" snapshot -d "$oldest" "${state[image]}"; then
+                    maintenance_ok=no; maintenance_error=snapshot_delete_failed; break
+                fi
+                kept=()
+                for candidate in "${managed_snapshots[@]}"; do [[ $candidate == "$oldest" ]] || kept+=("$candidate"); done
+                managed_snapshots=("${kept[@]}")
+            done
+            rm -f -- "$snapshot_output"
+            # 重新读取最新记录，不能用维护前的副本覆盖刚收到的 close。
+            exec {resource_fd}> "$runtime_dir/port-$port.lock" || exit 1
+            flock -w 2 "$resource_fd" || { printf '保存维护结果时无法取得资源锁。\n' >&2; exit 1; }
+            state=()
+            while IFS= read -r state_line || [[ -n $state_line ]]; do
+                [[ $state_line == *=* ]] && state[${state_line%%=*}]=${state_line#*=}
+            done < "$state_file"
+            if [[ $maintenance_ok == yes ]]; then state[maintenance]=done
+            else state[maintenance]=failed; state[maintenance_error]=$maintenance_error; overall_rc=1
+            fi
+            printf -v end_epoch '%(%s)T' -1
+            state[maintenance_end_epoch]=$end_epoch
+            state_lines=()
+            for key in "${!state[@]}"; do state_lines+=("$key=${state[$key]}"); done
+            if ! printf '%s\n' "${state_lines[@]}" > "$state_file.tmp.$$" || ! mv -f -- "$state_file.tmp.$$" "$state_file"; then
+                printf '保存维护结果失败。\n' >&2; exec {resource_fd}>&-; exit 1
+            fi
+            exec {resource_fd}>&-
+            printf '端口 %s 快照维护结束：%s %s。\n' "$port" "${state[maintenance]}" "${state[maintenance_error]-}" >&2
+        fi
+
+        # [12] 重置：标记已保存、资源锁已释放，才等待 systemd 停止和恢复。
+        if [[ $post_action == reset ]]; then
+            reset_ok=yes
+            reset_error=
+            if ! timeout --signal=TERM --kill-after=2s 185s "$systemctl_bin" stop "nbd-export@$port.socket" "nbd-export@$port.service"; then
+                reset_ok=no; reset_error=stop_failed
+            fi
+            old_alive=no
+            if [[ ${state[boot]} == "$server_boot" && -r /proc/${state[pid]}/stat ]]; then
+                proc_line=
+                IFS= read -r proc_line 2>/dev/null < "/proc/${state[pid]}/stat" || proc_line=
+                read -r -a proc_fields <<< "${proc_line##*) }"
+                [[ ${proc_fields[19]-} == "${state[pid_start]}" && ${proc_fields[0]-} != Z ]] && old_alive=yes
+            fi
+            if [[ $old_alive == yes ]]; then reset_ok=no; reset_error=old_process_still_present; fi
+            # finish 可能已更新本轮记录，必须重新读取。
+            exec {resource_fd}> "$runtime_dir/port-$port.lock" || exit 1
+            flock -w 2 "$resource_fd" || { printf '重置后无法取得资源锁。\n' >&2; exit 1; }
+            state=()
+            while IFS= read -r state_line || [[ -n $state_line ]]; do
+                [[ $state_line == *=* ]] && state[${state_line%%=*}]=${state_line#*=}
+            done < "$state_file"
+            if [[ $reset_ok == yes ]]; then
+                state[reset_result]=stopped
+                state[process]=exited
+                state[phase]=finished
+                [[ ${state[exit_result]} == incomplete ]] || state[exit_result]=abnormal
+            else state[reset_result]=failed; state[reset_error]=$reset_error; overall_rc=1
+            fi
+            state_lines=()
+            for key in "${!state[@]}"; do state_lines+=("$key=${state[$key]}"); done
+            if ! printf '%s\n' "${state_lines[@]}" > "$state_file.tmp.$$" || ! mv -f -- "$state_file.tmp.$$" "$state_file"; then
+                printf '保存重置结果失败，不恢复监听。\n' >&2; exec {resource_fd}>&-; exit 1
+            fi
+            exec {resource_fd}>&-
+            if [[ $reset_ok == yes ]]; then
+                if ! timeout --signal=TERM --kill-after=1s 5s "$systemctl_bin" reset-failed "nbd-export@$port.service" "nbd-export@$port.socket"; then
+                    reset_ok=no; reset_error=reset_failed_state_failed
+                elif ! timeout --signal=TERM --kill-after=1s 10s "$systemctl_bin" start "nbd-export@$port.socket"; then
+                    reset_ok=no; reset_error=listener_start_failed
+                elif ! timeout --signal=TERM --kill-after=1s 5s "$systemctl_bin" is-active --quiet "nbd-export@$port.socket"; then
+                    reset_ok=no; reset_error=listener_not_active
+                fi
+            fi
+            exec {resource_fd}> "$runtime_dir/port-$port.lock" || exit 1
+            flock -w 2 "$resource_fd" || { printf '保存入口恢复结果时无法取得锁。\n' >&2; exit 1; }
+            state=()
+            while IFS= read -r state_line || [[ -n $state_line ]]; do
+                [[ $state_line == *=* ]] && state[${state_line%%=*}]=${state_line#*=}
+            done < "$state_file"
+            if [[ $reset_ok == yes ]]; then state[reset_result]=done
+            else state[reset_result]=failed; state[reset_error]=$reset_error; overall_rc=1
+            fi
+            printf -v end_epoch '%(%s)T' -1
+            state[reset_end_epoch]=$end_epoch
+            state_lines=()
+            for key in "${!state[@]}"; do state_lines+=("$key=${state[$key]}"); done
+            if ! printf '%s\n' "${state_lines[@]}" > "$state_file.tmp.$$" || ! mv -f -- "$state_file.tmp.$$" "$state_file"; then
+                printf '保存入口恢复结果失败。\n' >&2; exec {resource_fd}>&-; exit 1
+            fi
+            exec {resource_fd}>&-
+            printf '端口 %s 重置结束：%s %s。\n' "$port" "${state[reset_result]}" "${state[reset_error]-}" >&2
+        fi
+    done
+done
+exit "$overall_rc"

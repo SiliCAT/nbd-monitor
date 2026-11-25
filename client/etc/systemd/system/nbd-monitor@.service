@@ -1,0 +1,21 @@
+[Unit]
+Description=Client-side NBD session monitor for %i (experimental)
+Wants=network-online.target
+After=network.target network-online.target
+Before=nbd@%i.service
+PartOf=nbd@%i.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/local/libexec/nbd-monitor run %i
+ExecStop=/usr/local/libexec/nbd-monitor disconnect %i
+TimeoutStartSec=15s
+TimeoutStopSec=40s
+KillMode=control-group
+Restart=no
+User=root
+Group=root
+UMask=0077
+StandardOutput=journal
+StandardError=journal
