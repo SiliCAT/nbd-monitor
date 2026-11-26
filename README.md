@@ -1,6 +1,10 @@
 # nbd-monitor
 
-基于 Bash、systemd、Debian nbd-client 和 qemu-nbd 的 NBD 双端连接监护与生命周期管理实验项目。
+**NBD Exit Protection & Diagnosis（NBD 退出保护与故障诊断）**
+
+基于 Bash、systemd、Debian nbd-client 和 qemu-nbd 的实验项目。核心目标是防止非正常退出造成旧连接、服务端导出实例或会话长期残留并阻断下一轮连接；在可信证据及安全授权下有限恢复接入能力，无法安全恢复时明确报告并有限失败。本项目不是通用 NBD 设备监控或存储拓扑管理系统。
+
+项目使命、研发准入原则、最小退出证据集 M0 与观察层精简审核见 [PROJECT-SCOPE.md](PROJECT-SCOPE.md)。先论证诊断增益，再决定是否扩展观察业务；新增持久化观察写入与主动处置须另行审核。
 
 ## 目录结构
 
