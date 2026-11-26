@@ -1,0 +1,8 @@
+# v0.0.1 — structure only; not a deployable configuration.
+# Field names and defaults are not frozen.
+[global]
+# client_id = ...
+# control_port = 10921
+
+# [nbd0]
+# control_host = ...
