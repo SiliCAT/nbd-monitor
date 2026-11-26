@@ -1,5 +1,5 @@
 #!/bin/bash
-# nbd-monitor v0.4.2-P1-R-A (development) - local exit observation; original v0.4 behavior retained
+# nbd-monitor v0.4.2-P1-R-A.1 (development) - local exit observation; original v0.4 behavior retained
 # 仅支持 TCP nbdtab、单客户端单连接、普通文件系统测试；不支持 swap。
 # Type=notify 在 previous 完成后、真实数据连接前报告 READY。
 # 原生 nbd@ 先停止，monitor ExecStop=disconnect 随后核验；仅显式启用后有限补做 detach。
@@ -118,14 +118,30 @@ obs_read_fields() {
 # Reuse the pre-READY worker's existing outer budget. No evidence means no
 # automatic binding, not a new startup condition.
 obs_preconnect() {
-    local rc=0 size output
-    [[ $obs_context_ok == yes && $obs_locked == yes && $session == unknown ]] || return 0
-    obs_valid_invocation "${INVOCATION_ID:-unknown}" || return 0
-    size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
-    output=$(timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" 2>/dev/null) || rc=$?
-    [[ $rc == 1 && $size == 0 ]] || return 0
-    obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 0
-    obs_atomic "$run_dir/observation.preconnect" "id=$obs_id" "boot=$boot_id" "monitor_invocation=$INVOCATION_ID" || :
+    local rc=unknown size=unknown reason
+    if [[ $obs_context_ok != yes || $session != unknown ]]; then reason=context_unverified
+    elif [[ $obs_locked != yes ]]; then reason=observation_lock_busy
+    elif ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then reason=monitor_invocation_invalid
+    else
+        size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
+        if [[ $size != 0 ]]; then reason=device_zero_unverified
+        else
+            rc=0
+            timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" >/dev/null 2>&1 || rc=$?
+            case $rc in
+                124|137) reason=connection_check_timeout ;;
+                0) reason=connection_already_present ;;
+                1)
+                    if ! obs_context_matches || [[ ${obs_ctx[id]} != "$obs_id" ]]; then reason=context_changed
+                    elif obs_atomic "$run_dir/observation.preconnect" "id=$obs_id" "boot=$boot_id" "monitor_invocation=$INVOCATION_ID"; then reason=written
+                    else reason=anchor_write_failed; fi ;;
+                *) reason=connection_check_failed ;;
+            esac
+        fi
+    fi
+    # Publish the anchor before any best-effort journal submission.
+    obs_emit "$obs_phase" "$obs_stage" native_preconnect_observed "PRECONNECT_REASON=$reason" "PRECONNECT_CHECK_RC=$rc" "PRECONNECT_SIZE_SECTORS=$size" "MONITOR_INVOCATION_ID=${INVOCATION_ID:-unknown}" || :
+    return 0
 }
 obs_binding_connection() {
     local -A st=() conn=()
@@ -146,8 +162,18 @@ obs_binding_note() {
     fi
     line="$obs_id $reason $rc $candidate $bound"
     [[ $line != "$previous" ]] || return 0
-    obs_emit "$obs_phase" "$obs_stage" native_invocation_binding "BIND_REASON=$reason" "QUERY_RC=$rc" "CANDIDATE_INVOCATION_ID=$candidate" "NATIVE_INVOCATION_ID=$bound" || :
+    local retry=yes
+    if [[ $reason == preconnect_unverified || $bound != unknown ]]; then retry=no; fi
+    # Preserve the retry decision even if logging consumes the remaining budget.
     obs_atomic "$run_dir/observation.bind-status" "$line" || :
+    obs_emit "$obs_phase" "$obs_stage" native_invocation_binding "BIND_REASON=$reason" "BIND_RETRY=$retry" "QUERY_RC=$rc" "CANDIDATE_INVOCATION_ID=$candidate" "NATIVE_INVOCATION_ID=$bound" || :
+}
+# A missing/invalid pre-READY anchor cannot be recreated for this observation.
+obs_binding_retryable() {
+    local id= reason= rest=
+    if IFS=' ' read -r id reason rest 2>/dev/null < "$run_dir/observation.bind-status" &&
+       [[ $id == "$obs_id" && $reason == preconnect_unverified ]]; then return 1; fi
+    return 0
 }
 obs_bind_invocation() {
     local -A anchor=() native=() monitor=()
@@ -156,7 +182,7 @@ obs_bind_invocation() {
     obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 0
     old=${obs_ctx[invocation]}
     if [[ $old == unknown ]]; then
-        if ! obs_read_fields anchor id boot monitor_invocation < "$run_dir/observation.preconnect" 2>/dev/null ||
+        if ! obs_read_fields anchor id boot monitor_invocation 2>/dev/null < "$run_dir/observation.preconnect" ||
            [[ ${anchor[id]:-} != "$obs_id" || ${anchor[boot]:-} != "$boot_id" || ${anchor[monitor_invocation]:-} != "${INVOCATION_ID:-unknown}" ]] ||
            ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then
             obs_binding_note preconnect_unverified unknown unknown "$old"; return 0
@@ -513,8 +539,9 @@ obs_worker() {
     if [[ $obs_action == bind ]]; then obs_bind_invocation || :; return 0; fi
     if [[ $obs_action == hook ]]; then obs_hook_native_result || :; fi
     if [[ $obs_action == baseline || $obs_action == snapshot || $obs_action == hook ]]; then obs_snapshot || :; fi
-    obs_kernel || :
+    # The pre-READY evidence window is irreversible; capture it first.
     if [[ $obs_action == init ]]; then obs_preconnect || :; fi
+    obs_kernel || :
     if [[ $obs_stage == disconnect-final ]]; then
         local native=unknown native_executed=unknown native_code=unknown native_status=unknown native_pid=unknown native_reason=handoff_unavailable native_invocation=unknown
         obs_read_native_handoff || :
@@ -1074,7 +1101,7 @@ if [[ $mode == run ]]; then
         # Bind only after registration, using independently checked evidence.
         obs_write_context || obs_emit startup run observation_runtime_write_failed "PATH=observation.state" || :
         obs_emit startup run session_created "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" \
-            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-A" || :
+            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-A.1" || :
         : # baseline captured immediately after register
     fi
 
@@ -1190,9 +1217,9 @@ if [[ $mode == run ]]; then
             obs_phase=runtime; [[ $obs_exit_started != yes ]] || obs_phase=exit
             obs_call 1.5s kernel run "$obs_phase" || :
         fi
-        # Retry only unknown bindings at low frequency, after ordinary business.
+        # Retry only recoverable unknown bindings, after ordinary business.
         if [[ $obs_exit_started == no && $observed_device == connected ]] && (( count > 0 && count % 30 == 0 )); then
-            if obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == unknown ]]; then
+            if obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == unknown ]] && obs_binding_retryable; then
                 obs_call 2.2s bind run runtime || :
             fi
         fi
