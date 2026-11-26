@@ -4,6 +4,9 @@ Wants=network-online.target
 After=network.target network-online.target
 Before=nbd@%i.service
 PartOf=nbd@%i.service
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
 
 [Service]
 Type=notify
