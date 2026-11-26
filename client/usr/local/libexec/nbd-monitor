@@ -1,5 +1,5 @@
 #!/bin/bash
-# nbd-monitor v0.4.2-P1-R-A.1 (development) - local exit observation; original v0.4 behavior retained
+# nbd-monitor v0.4.2-P1-R-A.2 (development) - local exit observation; original v0.4 behavior retained
 # 仅支持 TCP nbdtab、单客户端单连接、普通文件系统测试；不支持 swap。
 # Type=notify 在 previous 完成后、真实数据连接前报告 READY。
 # 原生 nbd@ 先停止，monitor ExecStop=disconnect 随后核验；仅显式启用后有限补做 detach。
@@ -115,45 +115,72 @@ obs_read_fields() {
     done
     for key in "$@"; do [[ ${dest[$key]+x} ]] || return 1; done
 }
+# Observation only: read the same sysfs attributes used by nbd-client 3.26.1.
+# No external command, no network probe, no authorization to detach.
+obs_sample_nbd_sysfs() {
+    local path=$1 value
+    obs_sysfs_size=unknown; obs_sysfs_pid=unknown; obs_sysfs_pid_state=unknown
+    [[ -d $path && -x $path && -r $path/size ]] || return 1
+    IFS= read -r value 2>/dev/null < "$path/size" || return 1
+    [[ $value =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    obs_sysfs_size=$value
+    if [[ -e $path/pid || -L $path/pid ]]; then
+        obs_sysfs_pid_state=unreadable
+        IFS= read -r value 2>/dev/null < "$path/pid" || return 1
+        obs_sysfs_pid_state=invalid
+        [[ $value =~ ^[1-9][0-9]*$ ]] || return 1
+        obs_sysfs_pid=$value; obs_sysfs_pid_state=present
+    else
+        obs_sysfs_pid_state=absent
+    fi
+    [[ -d $path && -x $path && -r $path/size ]]
+}
+obs_read_nbd_state() {
+    local path="${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev"
+    local first_size first_pid first_state
+    obs_sysfs_status=unknown; obs_sysfs_reason=sample_unverified
+    obs_sample_nbd_sysfs "$path" || return 0
+    first_size=$obs_sysfs_size; first_pid=$obs_sysfs_pid; first_state=$obs_sysfs_pid_state
+    obs_sample_nbd_sysfs "$path" || return 0
+    if [[ $first_size != "$obs_sysfs_size" || $first_pid != "$obs_sysfs_pid" || $first_state != "$obs_sysfs_pid_state" ]]; then
+        obs_sysfs_reason=sample_changed; return 0
+    fi
+    if [[ $obs_sysfs_size == 0 && $obs_sysfs_pid_state == absent ]]; then
+        obs_sysfs_status=disconnected; obs_sysfs_reason=consistent_sample
+    elif [[ $obs_sysfs_size != 0 && $obs_sysfs_pid_state == present ]]; then
+        obs_sysfs_status=connected; obs_sysfs_reason=consistent_sample
+    else obs_sysfs_reason=contradictory_sample; fi
+}
 # Reuse the pre-READY worker's existing outer budget. No evidence means no
 # automatic binding, not a new startup condition.
 obs_preconnect() {
-    local rc=unknown size=unknown reason
+    local reason obs_sysfs_size=unknown obs_sysfs_pid=unknown obs_sysfs_pid_state=unknown
+    local obs_sysfs_status=not_sampled obs_sysfs_reason=not_sampled
     if [[ $obs_context_ok != yes || $session != unknown ]]; then reason=context_unverified
     elif [[ $obs_locked != yes ]]; then reason=observation_lock_busy
     elif ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then reason=monitor_invocation_invalid
     else
-        size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
-        if [[ $size != 0 ]]; then reason=device_zero_unverified
-        else
-            rc=0
-            timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" >/dev/null 2>&1 || rc=$?
-            case $rc in
-                124|137) reason=connection_check_timeout ;;
-                0) reason=connection_already_present ;;
-                1)
-                    if ! obs_context_matches || [[ ${obs_ctx[id]} != "$obs_id" ]]; then reason=context_changed
-                    elif obs_atomic "$run_dir/observation.preconnect" "id=$obs_id" "boot=$boot_id" "monitor_invocation=$INVOCATION_ID"; then reason=written
-                    else reason=anchor_write_failed; fi ;;
-                *) reason=connection_check_failed ;;
-            esac
-        fi
+        obs_read_nbd_state
+        if [[ $obs_sysfs_status == connected ]]; then reason=connection_already_present
+        elif [[ $obs_sysfs_status != disconnected ]]; then reason=sysfs_state_unverified
+        elif ! obs_context_matches || [[ ${obs_ctx[id]} != "$obs_id" ]]; then reason=context_changed
+        elif obs_atomic "$run_dir/observation.preconnect" "id=$obs_id" "boot=$boot_id" "monitor_invocation=$INVOCATION_ID"; then reason=written
+        else reason=anchor_write_failed; fi
     fi
     # Publish the anchor before any best-effort journal submission.
-    obs_emit "$obs_phase" "$obs_stage" native_preconnect_observed "PRECONNECT_REASON=$reason" "PRECONNECT_CHECK_RC=$rc" "PRECONNECT_SIZE_SECTORS=$size" "MONITOR_INVOCATION_ID=${INVOCATION_ID:-unknown}" || :
+    obs_emit "$obs_phase" "$obs_stage" native_preconnect_observed "PRECONNECT_REASON=$reason" "PRECONNECT_CHECK_RC=not_executed" "PRECONNECT_SIZE_SECTORS=$obs_sysfs_size" "MONITOR_INVOCATION_ID=${INVOCATION_ID:-unknown}" "CHECK_SOURCE=sysfs" "SYSFS_DEVICE_STATUS=$obs_sysfs_status" "SYSFS_PID_STATE=$obs_sysfs_pid_state" "SYSFS_PID=$obs_sysfs_pid" "SYSFS_REASON=$obs_sysfs_reason" || :
     return 0
 }
 obs_binding_connection() {
     local -A st=() conn=()
-    local live size
-    obs_read_fields st client host port export session boot phase < "$run_dir/session.state" || return 1
+    obs_sysfs_size=unknown; obs_sysfs_pid=unknown; obs_sysfs_pid_state=unknown
+    obs_sysfs_status=not_sampled; obs_sysfs_reason=context_unverified
+    obs_read_fields st client host port export session boot phase 2>/dev/null < "$run_dir/session.state" || return 1
     [[ ${st[client]} == "$client_id" && ${st[host]} == "$data_host" && ${st[port]} == "$data_port" && ${st[export]} == "$data_export" && ${st[session]} == "$session" && ${st[boot]} == "$boot_id" && ${st[phase]} == running ]] || return 1
-    obs_read_fields conn session pid < "$run_dir/connection.state" || return 1
+    obs_read_fields conn session pid 2>/dev/null < "$run_dir/connection.state" || return 1
     [[ ${conn[session]} == "$session" && ${conn[pid]} =~ ^[1-9][0-9]*$ ]] || return 1
-    live=$(timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" 2>/dev/null) || return 1
-    size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
-    [[ $live == "${conn[pid]}" && $size =~ ^[0-9]+$ && $size != 0 ]] || return 1
-    printf '%s' "$live"
+    obs_read_nbd_state
+    [[ $obs_sysfs_status == connected && $obs_sysfs_pid == "${conn[pid]}" ]]
 }
 obs_binding_note() {
     local reason=$1 rc=$2 candidate=$3 bound=$4 previous= line
@@ -166,7 +193,7 @@ obs_binding_note() {
     if [[ $reason == preconnect_unverified || $bound != unknown ]]; then retry=no; fi
     # Preserve the retry decision even if logging consumes the remaining budget.
     obs_atomic "$run_dir/observation.bind-status" "$line" || :
-    obs_emit "$obs_phase" "$obs_stage" native_invocation_binding "BIND_REASON=$reason" "BIND_RETRY=$retry" "QUERY_RC=$rc" "CANDIDATE_INVOCATION_ID=$candidate" "NATIVE_INVOCATION_ID=$bound" || :
+    obs_emit "$obs_phase" "$obs_stage" native_invocation_binding "BIND_REASON=$reason" "BIND_RETRY=$retry" "QUERY_RC=$rc" "CANDIDATE_INVOCATION_ID=$candidate" "NATIVE_INVOCATION_ID=$bound" "CHECK_SOURCE=sysfs" "SYSFS_DEVICE_STATUS=${obs_sysfs_status:-not_sampled}" "SYSFS_PID_STATE=${obs_sysfs_pid_state:-unknown}" "SYSFS_PID=${obs_sysfs_pid:-unknown}" "SYSFS_SIZE_SECTORS=${obs_sysfs_size:-unknown}" "SYSFS_REASON=${obs_sysfs_reason:-not_sampled}" || :
 }
 # A missing/invalid pre-READY anchor cannot be recreated for this observation.
 obs_binding_retryable() {
@@ -177,7 +204,9 @@ obs_binding_retryable() {
 }
 obs_bind_invocation() {
     local -A anchor=() native=() monitor=()
-    local raw rc=0 first second candidate=unknown old
+    local raw rc=0 first first_size candidate=unknown old
+    local obs_sysfs_size=unknown obs_sysfs_pid=unknown obs_sysfs_pid_state=unknown
+    local obs_sysfs_status=not_sampled obs_sysfs_reason=not_sampled
     [[ $obs_context_ok == yes && $obs_locked == yes && $session != unknown ]] || return 0
     obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 0
     old=${obs_ctx[invocation]}
@@ -187,7 +216,8 @@ obs_bind_invocation() {
            ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then
             obs_binding_note preconnect_unverified unknown unknown "$old"; return 0
         fi
-        if ! first=$(obs_binding_connection); then obs_binding_note connection_unverified unknown unknown "$old"; return 0; fi
+        if ! obs_binding_connection; then obs_binding_note connection_unverified unknown unknown "$old"; return 0; fi
+        first=$obs_sysfs_pid; first_size=$obs_sysfs_size
     fi
     raw=$(timeout --foreground --kill-after=0.1s 0.4s "$systemctl_bin" show --all -p InvocationID -p ActiveState -p SubState -p ExecMainStartTimestampMonotonic "nbd@$dev.service" 2>/dev/null) || rc=$?
     if ((rc != 0)); then obs_binding_note native_query_failed "$rc" unknown "$old"; return 0; fi
@@ -210,7 +240,7 @@ obs_bind_invocation() {
        (( native[ExecMainStartTimestampMonotonic] <= monitor[ExecMainStartTimestampMonotonic] )); then
         obs_binding_note native_start_unverified 0 "$candidate" "$old"; return 0
     fi
-    if ! second=$(obs_binding_connection) || [[ $first != "$second" ]] || ! obs_context_matches ||
+    if ! obs_binding_connection || [[ $first != "$obs_sysfs_pid" || $first_size != "$obs_sysfs_size" ]] || ! obs_context_matches ||
        [[ ${obs_ctx[id]} != "$obs_id" || ${obs_ctx[invocation]} != unknown ]]; then
         obs_binding_note context_or_connection_changed 0 "$candidate" "$old"; return 0
     fi
@@ -1101,7 +1131,7 @@ if [[ $mode == run ]]; then
         # Bind only after registration, using independently checked evidence.
         obs_write_context || obs_emit startup run observation_runtime_write_failed "PATH=observation.state" || :
         obs_emit startup run session_created "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" \
-            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-A.1" || :
+            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-A.2" || :
         : # baseline captured immediately after register
     fi
 
