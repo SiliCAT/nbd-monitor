@@ -1,5 +1,5 @@
 #!/bin/bash
-# nbd-monitor v0.4.2-P1-R-B (development) - local exit observation; original v0.4 behavior retained
+# nbd-monitor v0.4.2-M0 (development) - minimal exit evidence; original v0.4 control retained
 # 仅支持 TCP nbdtab、单客户端单连接、普通文件系统测试；不支持 swap。
 # Type=notify 在 previous 完成后、真实数据连接前报告 READY。
 # 原生 nbd@ 先停止，monitor ExecStop=disconnect 随后核验；仅显式启用后有限补做 detach。
@@ -11,7 +11,7 @@ export LC_ALL=C
 log() { printf 'nbd-monitor: %s\n' "$*" >&2; }
 die() { failure_reason=$*; log "错误：$*"; exit 1; }
 
-# P1 observation layer. All entry points are best-effort; never used for
+# M0 exit evidence. All entry points are best-effort; never used for
 # device_status, detach authorization, protocol replies or session transitions.
 # No new persistent files, no remote reports, no BPF.
 declare -A obs_call_status=()
@@ -50,10 +50,7 @@ obs_emit() {
         "${NBD_MONITOR_OBS_LOGGER:-/usr/bin/logger}" --journald >/dev/null 2>&1; then
         return 0
     fi
-    # Fallback uses the original systemd stderr channel, preserves evidence.
-    if [[ -n ${run_dir:-} && -d $run_dir ]]; then
-        obs_atomic "$run_dir/observation.fallback" "${payload:0:60000}" 2>/dev/null || :
-    fi
+    # Fallback uses original systemd stderr; no observation cache file.
     printf 'nbd-monitor: journal_submit_failed %s\n' "$(obs_escape "$payload")" >&2 || :
     return 0
 }
@@ -293,349 +290,6 @@ obs_call() {
     obs_call_status[$action]=$rc
     return 0
 }
-obs_attr() {
-    local path=$1 v
-    if [[ ! -e $path ]]; then printf 'not_exposed'; return; fi
-    if IFS= read -r v < "$path"; then printf '%s' "$v"; else printf 'unknown'; fi
-}
-# Observation only. Never resolve a mount target or open a block device.
-# Keep mountinfo's kernel-escaped root/target/source in evidence records.
-obs_mount_source_id() {
-    local source=$1 blocks=$2 devroot=$3 name link dir leaf
-    source=${source//\\040/ }; source=${source//\\011/$'\t'}
-    source=${source//\\012/$'\n'}; source=${source//\\134/\\}
-    case $source in
-        /dev/disk/by-*/*|/dev/mapper/*|/dev/block/*)
-            dir=${source%/*}; leaf=${source##*/}
-            case $dir in /dev/disk/by-uuid|/dev/disk/by-label|/dev/disk/by-id|/dev/disk/by-path|/dev/disk/by-partuuid|/dev/disk/by-partlabel|/dev/mapper|/dev/block) ;; *) return 1;; esac
-            [[ -n $leaf && $leaf != . && $leaf != .. && $leaf != *[[:cntrl:]]* ]] || return 1
-            # Only standard local device alias directories; never chase arbitrary links.
-            [[ ! -L $devroot && ! -L $devroot/disk && ! -L $devroot/${dir#/dev/} ]] || return 1
-            link=$(/usr/bin/readlink -- "$devroot/${source#/dev/}" 2>/dev/null) || return 1
-            case $dir:$link in
-                /dev/disk/*:../../*) name=${link#../../} ;;
-                /dev/mapper:../*|/dev/block:../*) name=${link#../} ;;
-                *:/dev/*) name=${link#/dev/} ;;
-                *) return 1 ;;
-            esac ;;
-        /dev/*) name=${source#/dev/} ;;
-        *) return 1 ;;
-    esac
-    [[ $name =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$ ]] || return 1
-    # A canonical kernel block name is resolved through sysfs, not mount paths.
-    [[ ! -L $devroot/$name ]] || return 1
-    IFS= read -r obs_mount_source_mm 2>/dev/null < "$blocks/$name/dev" || return 1
-    [[ $obs_mount_source_mm =~ ^[0-9]+:[0-9]+$ ]] || return 1
-    [[ $source != /dev/block/* || ${source##*/} == "$obs_mount_source_mm" ]]
-}
-# Inputs are proc/sysfs paths, plus already observed NBD/partition dev_t values.
-# This is a bounded, non-atomic self-namespace observation, never detach authorization.
-obs_mount_refs() {
-    local info=$1 blocks=$2 btrfs=$3 devroot=$4 ids_ok=$5
-    shift 5
-    local -A wanted=() member_group=() target_group=() group_partial=() source_cache=() seen_mount=()
-    local id fs uuid entry mm n=0 entries=0 groups=0 members=0 devinfos=0 sources=0 missing
-    local line sep i mid fsmm root target fstype source source_mm group method rec
-    local partial=no inventory=not_sampled loaded=no truncated=no count=0
-    local obs_mount_source_mm=unknown
-    local -a cols=()
-    mounts=unknown; mount_state=unknown; mount_coverage=unknown; mount_refs=; mount_count=0
-    mount_btrfs_inventory=not_sampled; mount_truncated=no
-    for id in "$@"; do [[ $id =~ ^[0-9]+:[0-9]+$ ]] && wanted[$id]=yes; done
-    [[ $ids_ok == yes && ${#wanted[@]} -gt 0 ]] || partial=yes
-    [[ -r $info ]] || return 0
-    mounts=; mount_coverage=complete
-    # A readable proc record is evidence only within the reader's root/namespace.
-    while :; do
-        line=
-        if ! IFS= read -r line; then
-            if [[ -n $line ]]; then ((n+=1)); partial=yes; fi
-            break
-        fi
-        ((n+=1))
-        if (( n > 4096 || ${#line} > 16384 )); then partial=yes; truncated=yes; break; fi
-        IFS=' ' read -r -a cols <<< "$line"
-        sep=-1
-        for ((i=6;i<${#cols[@]};i++)); do
-            if [[ ${cols[i]} == - ]]; then sep=$i; break; fi
-        done
-        if (( sep < 6 || ${#cols[@]} != sep+4 )) ||
-           [[ ! ${cols[0]:-} =~ ^[0-9]+$ || ! ${cols[1]:-} =~ ^[0-9]+$ || ! ${cols[2]:-} =~ ^[0-9]+:[0-9]+$ || ${cols[3]:-} != /* || ${cols[4]:-} != /* ]]; then
-            partial=yes; continue
-        fi
-        mid=${cols[0]}; fsmm=${cols[2]}; root=${cols[3]}; target=${cols[4]}
-        fstype=${cols[sep+1]}; source=${cols[sep+2]}; method=; source_mm=unknown; group=unknown
-        if [[ ${seen_mount[$mid]+x} ]]; then partial=yes; continue; fi
-        seen_mount[$mid]=yes
-        if [[ ${wanted[$fsmm]+x} ]]; then method=block_dev_t; fi
-        if [[ $fstype == btrfs ]]; then
-            # Lazy inventory: do not touch Btrfs sysfs unless a visible Btrfs mount exists.
-            if [[ $loaded == no ]]; then
-                loaded=yes; inventory=complete
-                if [[ ! -d $btrfs || ! -r $btrfs || ! -x $btrfs ]]; then inventory=partial
-                else
-                    for fs in "$btrfs"/*; do
-                        uuid=${fs##*/}
-                        [[ $uuid =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || continue
-                        ((groups+=1)); if ((groups > 64)); then inventory=partial; truncated=yes; break; fi
-                        members=0; devinfos=0
-                        if [[ ! -d $fs/devices || ! -r $fs/devices || ! -x $fs/devices ]]; then group_partial[$uuid]=yes; inventory=partial; continue; fi
-                        for entry in "$fs"/devices/*; do
-                            [[ -e $entry || -L $entry ]] || continue
-                            ((entries+=1)); if ((entries > 256)); then group_partial[$uuid]=yes; inventory=partial; truncated=yes; break; fi
-                            if ! IFS= read -r mm 2>/dev/null < "$entry/dev" || [[ ! $mm =~ ^[0-9]+:[0-9]+$ ]]; then group_partial[$uuid]=yes; continue; fi
-                            ((members+=1))
-                            if [[ ${member_group[$mm]+x} && ${member_group[$mm]} != "$uuid" ]]; then member_group[$mm]=ambiguous; inventory=partial
-                            else member_group[$mm]=$uuid; fi
-                            [[ ! ${wanted[$mm]+x} ]] || target_group[$uuid]=yes
-                        done
-                        if [[ ! -d $fs/devinfo || ! -r $fs/devinfo || ! -x $fs/devinfo ]]; then group_partial[$uuid]=yes
-                        else
-                            for entry in "$fs"/devinfo/*; do
-                                [[ -e $entry || -L $entry ]] || continue
-                                ((entries+=1)); if ((entries > 256)); then group_partial[$uuid]=yes; inventory=partial; truncated=yes; break; fi
-                                ((devinfos+=1))
-                                if ! IFS= read -r missing 2>/dev/null < "$entry/missing" || [[ $missing != 0 ]]; then group_partial[$uuid]=yes; fi
-                            done
-                        fi
-                        if ((members == 0 || members != devinfos)); then group_partial[$uuid]=yes; fi
-                        if [[ ${group_partial[$uuid]+x} ]]; then inventory=partial; fi
-                        if ((entries > 256)); then break; fi
-                    done
-                fi
-                ((groups > 0)) || inventory=partial
-            fi
-            if [[ ${source_cache[$source]+x} ]]; then source_mm=${source_cache[$source]}
-            else
-                ((sources+=1))
-                if ((sources > 128)); then partial=yes; truncated=yes
-                elif obs_mount_source_id "$source" "$blocks" "$devroot"; then source_mm=$obs_mount_source_mm; fi
-                source_cache[$source]=$source_mm
-            fi
-            group=${member_group[$source_mm]:-unknown}
-            if [[ ${wanted[$source_mm]+x} ]]; then method=btrfs_source_dev_t
-            elif [[ $group != unknown && $group != ambiguous && ${target_group[$group]+x} ]]; then method=btrfs_member_dev_t; fi
-            # Never infer an unrelated Btrfs mount from an unresolvable source.
-            if [[ $inventory != complete || $group == unknown || $group == ambiguous || ${group_partial[$group]+x} ]]; then partial=yes; fi
-        fi
-        [[ -n $method ]] || continue
-        ((count+=1))
-        rec="$mid"$'\t'"$fsmm"$'\t'"$fstype"$'\t'"$source"$'\t'"$root"$'\t'"$target"$'\t'"$method"$'\t'"$source_mm"$'\t'"$group"
-        if (( ${#mount_refs}+${#rec}+1 > 8192 || ${#mounts}+${#target}+${#fsmm}+2 > 4096 )); then partial=yes; truncated=yes; continue; fi
-        mounts+="${mounts:+$'\n'}$fsmm:$target"
-        mount_refs+="${mount_refs:+$'\n'}$rec"
-    done 2>/dev/null < "$info" || partial=yes
-    mount_count=$count; mount_btrfs_inventory=$inventory; mount_truncated=$truncated
-    if ((n == 0)); then mount_state=unknown; mount_coverage=unknown; mounts=unknown
-    else
-        [[ $partial == no ]] || mount_coverage=partial
-        if ((count > 0)); then mount_state=present; [[ -n $mounts ]] || mounts=present_details_truncated
-        elif [[ $partial == yes ]]; then mount_state=partial; mounts=partial
-        else mount_state=none_observed; mounts=none_observed; fi
-    fi
-    return 0
-}
-# Namespace identity is metadata, not a request to enter another namespace.
-obs_mount_namespace() {
-    local self=$1 pid1=$2 ns
-    mount_namespace=unknown; mount_pid1_relation=unknown
-    ns=$(/usr/bin/readlink -- "$self" 2>/dev/null) || return 0
-    [[ $ns =~ ^mnt:\[[0-9]+\]$ ]] || return 0
-    mount_namespace=$ns
-    if [[ -e $self && -e $pid1 ]]; then
-        if [[ $self -ef $pid1 ]]; then mount_pid1_relation=same; else mount_pid1_relation=different; fi
-    fi
-    return 0
-}
-obs_snapshot() {
-    local base="${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev" rc=0 pid size check inflight stat ro queue drv holder entry
-    local tcp_rc=unknown tcp_raw= tcp_result=unknown tcp_scope=endpoint_candidates host=${data_host:-unknown}
-    local -a fields=() holders=()
-    size=$(obs_attr "$base/size"); pid=$(obs_attr "$base/pid")
-    inflight=$(obs_attr "$base/inflight"); stat=$(obs_attr "$base/stat")
-    ro=$(obs_attr "$base/ro"); queue=$(obs_attr "$base/queue/io_timeout")
-    drv=$(obs_attr "${NBD_MONITOR_OBS_DEBUGFS:-/sys/kernel/debug/nbd}/$dev/timeout")
-    check=$(timeout --foreground --kill-after=0.1s 0.4s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" 2>/dev/null) || rc=$?
-    local status=unknown
-    if [[ $size =~ ^[0-9]+$ ]]; then
-        if [[ $rc == 0 && $size != 0 ]]; then status=connected; elif [[ $rc == 1 && $size == 0 ]]; then status=disconnected; fi
-    fi
-    local holders_state=unknown mounts=unknown swaps=unknown id partition
-    local ids_ok=no mount_state mount_coverage mount_refs mount_count mount_btrfs_inventory mount_truncated mount_namespace mount_pid1_relation
-    local -a ids=() nodes=("$base") mount_fields=()
-    for partition in "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/""$dev"p[0-9]*; do [[ -e $partition ]] && nodes+=("$partition"); done
-    holders_state=none_observed
-    for entry in "${nodes[@]}"; do
-        id=$(obs_attr "$entry/dev"); [[ $id =~ ^[0-9]+:[0-9]+$ ]] && ids+=("$id")
-        if [[ ! -d $entry/holders || ! -r $entry/holders ]]; then holders_state=unknown; continue; fi
-        for holder in "$entry"/holders/*; do [[ -e $holder ]] && holders+=("${entry##*/}:${holder##*/}"); done
-    done
-    ((${#holders[@]} == 0)) || holders_state=present
-    ((${#ids[@]} == ${#nodes[@]})) && ids_ok=yes
-    obs_mount_refs /proc/self/mountinfo "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}" /sys/fs/btrfs /dev "$ids_ok" "${ids[@]}"
-    obs_mount_namespace /proc/self/ns/mnt /proc/1/ns/mnt
-    if [[ $mount_namespace == unknown && $mount_coverage == complete ]]; then
-        mount_coverage=partial
-        if [[ $mount_state == none_observed ]]; then mount_state=partial; mounts=partial; fi
-    fi
-    mount_fields=("MOUNTS_SELF_NAMESPACE=$mounts" "MOUNTS_STATE=$mount_state" "MOUNTS_COVERAGE=$mount_coverage" "MOUNTS_SCOPE=self_visible_direct_block_and_btrfs" \
-        "MOUNT_NAMESPACE_ID=$mount_namespace" "MOUNT_NAMESPACE_PID1_RELATION=$mount_pid1_relation" "MOUNTS_COUNT=$mount_count" "MOUNTS_REFS=$mount_refs" \
-        "MOUNTS_BTRFS_INVENTORY=$mount_btrfs_inventory" "MOUNTS_TRUNCATED=$mount_truncated")
-    # /proc/swaps path matching is only an observation in this namespace, not
-    # the existing rescue safety check (aliases may not resolve here).
-    if [[ -r /proc/swaps ]]; then
-        swaps=$(awk -v d="/dev/$dev" 'NR>1 && ($1==d || $1 ~ ("^" d "p[0-9]+$")){print $1}' /proc/swaps) || swaps=unknown
-        [[ -n $swaps ]] || swaps=none_observed_by_path
-    fi
-    # Numeric literal addresses only; no DNS at shutdown. IPv6 support is
-    # best-effort using ss's literal address filter (no parsing of its output).
-    if [[ $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || ( $host == *:* && $host =~ ^[0-9a-fA-F:]+$ ) ]] && [[ ${data_port:-} =~ ^[0-9]{1,5}$ ]]; then
-        tcp_rc=0
-        tcp_raw=$(timeout --foreground --kill-after=0.1s 0.6s "${NBD_MONITOR_OBS_SS:-/usr/bin/ss}" -H -ntaoie "( dst $host and dport = :$data_port )" 2>/dev/null) || tcp_rc=$?
-        if ((tcp_rc == 0)); then
-            if [[ -n $tcp_raw ]]; then tcp_result=candidates_visible; else tcp_result=no_candidates_visible; fi
-        else tcp_result=query_failed; fi
-    else tcp_result=endpoint_unresolved; fi
-    local truncated=no
-    if ((${#tcp_raw} > 12000)); then tcp_raw=${tcp_raw:0:12000}; truncated=yes; fi
-    local inflight_read=unknown inflight_write=unknown
-    if [[ $inflight =~ ^[[:space:]]*([0-9]+)[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
-        inflight_read=${BASH_REMATCH[1]}; inflight_write=${BASH_REMATCH[2]}
-    fi
-    fields=("DEVICE_STATUS=$status" "DEVICE_SIZE_SECTORS=$size" "DEVICE_PID=$pid" "CHECK_RC=$rc" "CHECK_OUTPUT=$check" \
-        "INFLIGHT_RAW=$inflight" "INFLIGHT_READ=$inflight_read" "INFLIGHT_WRITE=$inflight_write" "BLOCK_STAT_RAW=$stat" "DEVICE_RO=$ro" "QUEUE_IO_TIMEOUT_MS=$queue" "DRIVER_TIMEOUT_RAW=$drv" \
-        "MAJOR_MINOR=$(obs_attr "$base/dev")" "HOLDERS_STATE=$holders_state" "HOLDERS=${holders[*]}" "${mount_fields[@]}" "SWAPS_PATH_ONLY=$swaps" \
-        "TCP_MAPPING=unverified" "TCP_SCOPE=$tcp_scope" "TCP_RESULT=$tcp_result" "TCP_QUERY_RC=$tcp_rc" "TCP_RAW=$tcp_raw" "TCP_TRUNCATED=$truncated")
-    local path="$run_dir/observation.latest" field
-    [[ $obs_action != baseline ]] || path="$run_dir/observation.baseline"
-    # No stale/unknown hook may overwrite the current context's runtime files.
-    if [[ $obs_context_ok == yes && $obs_locked == yes ]]; then
-        local -a saved_fields=("observation_id=$obs_id" "boot=$boot_id" "session=$session" "stage=$obs_stage")
-        for field in "${fields[@]}"; do saved_fields+=("$(obs_escape "$field")"); done
-        obs_atomic "$path" "${saved_fields[@]}" || obs_emit "$obs_phase" "$obs_stage" observation_runtime_write_failed "PATH=${path##*/}" || :
-    fi
-    obs_summary_device=$status; obs_summary_size=$size; obs_summary_check_rc=$rc; obs_summary_tcp=$tcp_result
-    if [[ $obs_action == baseline ]]; then
-        local pkgver
-        pkgver=$(timeout --foreground --kill-after=0.1s 0.3s /usr/bin/dpkg-query -W -f='${Version}' nbd-client 2>/dev/null) || pkgver=unknown
-        obs_emit startup run device_connected "CLIENT_PACKAGE_VERSION=$pkgver" "CONNECTION_CONFIRMED_BEFORE_REGISTER=yes" "DEVICE_STATUS_AT_SAMPLE=$status" "DEVICE_SIZE_SECTORS=$size" "DEVICE_PID=$pid" "CHECK_RC=$rc" "DATA_HOST=${data_host:-unknown}" "DATA_PORT=${data_port:-unknown}" "EXPORT=${data_export:-unknown}" "${mount_fields[@]}" || :
-    else
-        obs_emit "$obs_phase" "$obs_stage" device_tcp_snapshot "${fields[@]}" || :
-    fi
-}
-# Journal cursor is scoped to boot + observation ID. It is not advanced after
-# a failed query. Bounded fallback may duplicate old messages; disclose gaps.
-obs_kernel() {
-    local cursor= prior_id= prior_boot= line key val out rc=0 new_cursor= count=0 relevant=0 raw= gap=no mode=incremental prior_gap=no prior_query=unknown
-    local disc=not_observed senderr=not_observed shutdown=not_observed zero=not_observed error_raw= error_codes=
-    local journal=${NBD_MONITOR_OBS_JOURNALCTL:-/usr/bin/journalctl} file="$run_dir/kernel.cursor"
-    local -a args=(-k -b "${boot_id//-/}" --no-pager --no-hostname -o short-monotonic --show-cursor)
-    if [[ $obs_context_ok == yes && -r $file ]]; then
-        while IFS= read -r line; do
-            key=${line%%=*}; val=${line#*=}
-            case $key in id) prior_id=$val;; boot) prior_boot=$val;; cursor) cursor=$val;; query) prior_query=$val;;
-                gap) [[ $val == yes ]] && gap=yes;; disconnect) [[ $val == yes ]] && disc=yes;;
-                send_error) [[ $val == yes ]] && senderr=yes;; shutdown) [[ $val == yes ]] && shutdown=yes;;
-                zero) [[ $val == yes ]] && zero=yes;; esac
-        done < "$file"
-        if [[ $prior_id != "$obs_id" || $prior_boot != "$boot_id" ]]; then cursor=; gap=no; prior_query=unknown; disc=not_observed; senderr=not_observed; shutdown=not_observed; zero=not_observed; fi
-    fi
-    prior_gap=$gap
-    if [[ $obs_action == init ]]; then
-        # Start at latest existing kernel message; baseline is before READY.
-        out=$(timeout --foreground --kill-after=0.1s 0.7s "$journal" "${args[@]}" -n 1 2>/dev/null) || rc=$?
-        if ((rc == 0)); then
-            while IFS= read -r line; do [[ $line == '-- cursor: '* ]] && new_cursor=${line#-- cursor: }; done <<< "$out"
-        fi
-        [[ -n $new_cursor ]] || gap=yes
-    else
-        if [[ -n $cursor && $cursor != *[[:space:]]* ]]; then
-            out=$(timeout --foreground --kill-after=0.1s 1s "$journal" "${args[@]}" --after-cursor="$cursor" -n +257 2>/dev/null) || rc=$?
-        else rc=1; fi
-        if ((rc != 0)); then
-            mode=bounded_fallback; gap=yes; rc=0
-            out=$(timeout --foreground --kill-after=0.1s 0.8s "$journal" "${args[@]}" --since=-120sec -n 257 2>/dev/null) || rc=$?
-        fi
-        if ((rc == 0)); then
-            while IFS= read -r line; do
-                if [[ $line == '-- cursor: '* ]]; then new_cursor=${line#-- cursor: }; continue; fi
-                [[ $line == '['* ]] || continue
-                ((count+=1))
-                [[ $line =~ (^|[^[:alnum:]_])${dev}(p[0-9]+)?([^[:alnum:]_]|$) ]] || continue
-                ((relevant+=1))
-                # Preserve the original monotonic timestamp and text.
-                if ((${#raw}+${#line}<24000)); then raw+="$line"$'\n'; else gap=yes; fi
-                # A fallback window can overlap a previous incarnation of the
-                # same nbdN. Keep the raw candidate, but do not promote it to a
-                # confirmed per-session observation or cumulative flag.
-                case $line in
-                    *NBD_DISCONNECT*) [[ $mode == incremental ]] && disc=yes;;
-                    *'Send disconnect failed'*)
-                        [[ $mode != incremental ]] || senderr=yes
-                        if ((${#error_raw}+${#line}<12000)); then error_raw+="$line"$'\n'; else gap=yes; fi
-                        if [[ $line =~ Send\ disconnect\ failed[[:space:]]+(-?[0-9]+) ]]; then error_codes+="${BASH_REMATCH[1]} "; fi
-                        ;;
-                    *'shutting down sockets'*) [[ $mode != incremental ]] || shutdown=yes;;
-                    *'detected capacity change'*' to 0'*) [[ $mode != incremental ]] || zero=yes;;
-                esac
-            done <<< "$out"
-            ((count < 257)) || gap=yes
-            # A bounded recent raw batch is useful for an exit trigger missed
-            # by the sampler; preserve it in RAM, not in permanent logs.
-            if [[ $obs_context_ok == yes && $obs_locked == yes && -n $raw && $obs_phase != exit && $mode == incremental ]]; then
-                obs_atomic "$run_dir/kernel.recent" "id=$obs_id" "$raw" || :
-            fi
-            # Startup/ordinary kernel messages are already in the native
-            # journal. Duplicate into structured evidence only for exit or
-            # significant runtime errors/transition messages.
-            if [[ -n $raw ]]; then
-                if [[ $mode == bounded_fallback ]]; then
-                    if [[ $obs_phase == exit || $prior_query != fallback ]]; then
-                        obs_emit "$obs_phase" "$obs_stage" kernel_candidate_messages "KERNEL_RAW=$raw" "KERNEL_QUERY_MODE=$mode" "KERNEL_ASSOCIATION=unverified_window" "KERNEL_RELEVANT_COUNT=$relevant" || :
-                    fi
-                elif [[ $obs_phase == exit || $raw =~ (NBD_DISCONNECT|[Ss]end\ disconnect\ failed|[Ss]hutting\ down\ sockets|[Dd]isconnected|[Ee]rror|[Ff]ailed|[Tt]imeout|[Ss]tuck\ request) ]]; then
-                    obs_emit "$obs_phase" "$obs_stage" kernel_nbd_messages "KERNEL_RAW=$raw" "KERNEL_QUERY_MODE=$mode" "KERNEL_ASSOCIATION=device_window" "KERNEL_RELEVANT_COUNT=$relevant" || :
-                fi
-                if [[ -n $error_raw ]]; then
-                    if [[ $mode == incremental ]]; then
-                        obs_emit "$obs_phase" "$obs_stage" kernel_disconnect_send_failed "KERNEL_RAW=$error_raw" "KERNEL_ERROR_CODES=${error_codes% }" "KERNEL_ASSOCIATION=device_window" || :
-                    elif [[ $obs_phase == exit || $prior_query != fallback ]]; then
-                        obs_emit "$obs_phase" "$obs_stage" kernel_disconnect_send_failed_candidate "KERNEL_RAW=$error_raw" "KERNEL_ERROR_CODES=${error_codes% }" "KERNEL_ASSOCIATION=unverified_window" || :
-                    fi
-                fi
-            fi
-        else gap=yes; fi
-        [[ -n $new_cursor ]] || { [[ $mode == incremental && $count == 0 && $rc == 0 ]] && new_cursor=$cursor; }
-        [[ -n $new_cursor ]] || gap=yes
-    fi
-    if [[ $obs_phase == exit && $obs_context_ok == yes && $obs_locked == yes && -r $run_dir/kernel.recent ]]; then
-        local recent_id recent_raw
-        { IFS= read -r recent_id; recent_raw=$(cat); } < "$run_dir/kernel.recent"
-        if [[ $recent_id == "id=$obs_id" && -n $recent_raw ]]; then
-            obs_emit exit "$obs_stage" kernel_pre_exit_context "KERNEL_RAW=$recent_raw" "CONTEXT=previous_runtime_batch_may_overlap" || :
-        fi
-        rm -f -- "$run_dir/kernel.recent" 2>/dev/null || :
-    fi
-    local query_result=ok
-    if ((rc != 0)); then query_result=failed
-    elif [[ $mode == bounded_fallback ]]; then query_result=fallback
-    elif [[ -z $new_cursor ]]; then query_result=no_cursor
-    fi
-    if [[ $obs_context_ok == yes && $obs_locked == yes ]]; then
-        # On failure retain previous valid cursor; gap remains sticky.
-        [[ -n $new_cursor ]] || new_cursor=$cursor
-        obs_atomic "$file" "id=$obs_id" "boot=$boot_id" "cursor=$new_cursor" "gap=$gap" "query=$query_result" "disconnect=$disc" "send_error=$senderr" "shutdown=$shutdown" "zero=$zero" || gap=yes
-    else gap=yes; fi
-    if [[ $gap == yes ]]; then
-        [[ $disc == yes ]] || disc=unknown; [[ $senderr == yes ]] || senderr=unknown
-        [[ $shutdown == yes ]] || shutdown=unknown; [[ $zero == yes ]] || zero=unknown
-    fi
-    obs_summary_disc=$disc; obs_summary_senderr=$senderr; obs_summary_shutdown=$shutdown; obs_summary_zero=$zero; obs_summary_gap=$gap
-    if [[ $obs_phase == exit || ( $gap == yes && $prior_gap == no ) || ( $prior_query != unknown && $query_result != "$prior_query" ) ]]; then
-        obs_emit "$obs_phase" "$obs_stage" kernel_observation_summary "KERNEL_QUERY_RC=$rc" "KERNEL_QUERY_RESULT=$query_result" "KERNEL_QUERY_MODE=$mode" "KERNEL_EVIDENCE_GAP=$gap" "KERNEL_COVERAGE=best_effort" \
-            "DISCONNECT_OBSERVED=$disc" "DISCONNECT_SEND_ERROR_OBSERVED=$senderr" "SOCKET_SHUTDOWN_OBSERVED=$shutdown" "CAPACITY_ZERO_OBSERVED=$zero" || :
-    fi
-}
 # Parse only the known, single Debian native ExecStop record. Unknown formats
 # remain raw evidence, never success. No observation/session identity required.
 obs_parse_native_stop() {
@@ -664,6 +318,11 @@ obs_parse_native_stop() {
         native_code=$code; native_status=$status; native_start=$st; native_end=$en; native_reason=verified_not_executed
         return 0
     fi
+    if [[ $st =~ $time_re && $en == n/a && $pid =~ ^[1-9][0-9]*$ && $code == '(null)' && ( $status == 0 || $status == 0/0 ) ]]; then
+        native_executed=yes; native_result=started_no_result; native_pid=$pid
+        native_code=$code; native_status=$status; native_start=$st; native_end=$en; native_reason=verified_start_only
+        return 0
+    fi
     native_reason=invalid_execution_record
     [[ $st =~ $time_re && $en =~ $time_re && $pid =~ ^[1-9][0-9]*$ && $status =~ $status_re ]] || return 0
     case $code in
@@ -677,9 +336,11 @@ obs_parse_native_stop() {
 }
 obs_hook_native_result() {
     local raw rc=0 native_executed native_result native_pid native_code native_status native_start native_end native_query_invocation native_reason
-    local handoff=unassociated
+    local handoff=unassociated obs_sysfs_size=unknown obs_sysfs_pid=unknown obs_sysfs_pid_state=unknown
+    local obs_sysfs_status=unknown obs_sysfs_reason=unknown
     raw=$(timeout --foreground --kill-after=0.1s 0.5s "$systemctl_bin" show -p ExecStop -p InvocationID "nbd@$dev.service" 2>/dev/null) || rc=$?
     obs_parse_native_stop "$raw" "$rc" "${INVOCATION_ID:-unknown}"
+    obs_read_nbd_state
     # Native hook is the single writer; never wait on observe.lock. Validate
     # association again just before publishing the strictly scoped sidecar.
     if [[ $obs_context_ok == yes ]] && obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == "${INVOCATION_ID:-unknown}" ]]; then
@@ -690,21 +351,22 @@ obs_hook_native_result() {
     obs_emit exit observe-stop native_stop_observed "NATIVE_STOP_EXECUTED=$native_executed" "NATIVE_STOP_RESULT=$native_result" "NATIVE_STOP_PID=$native_pid" "NATIVE_STOP_CODE=$native_code" "NATIVE_STOP_STATUS=$native_status" "NATIVE_STOP_START=$native_start" "NATIVE_STOP_END=$native_end" "NATIVE_INVOCATION_ID=${INVOCATION_ID:-unknown}" "NATIVE_QUERY_INVOCATION_ID=$native_query_invocation" "NATIVE_FACT_REASON=$native_reason" \
         "NATIVE_SERVICE_RESULT=${SERVICE_RESULT:-unknown}" "NATIVE_MAIN_EXIT_CODE=${EXIT_CODE:-unknown}" \
         "NATIVE_MAIN_EXIT_STATUS=${EXIT_STATUS:-unknown}" "NATIVE_EXECSTOP_QUERY_RC=$rc" "NATIVE_EXECSTOP_RAW=$raw" \
-        "CONTEXT_MATCH=$obs_context_ok" "CONTEXT_REASON=${obs_context_reason:-unknown}" "NATIVE_HANDOFF=$handoff" || :
+        "CONTEXT_MATCH=$obs_context_ok" "CONTEXT_REASON=${obs_context_reason:-unknown}" "NATIVE_HANDOFF=$handoff" \
+        "DEVICE_STATUS=$obs_sysfs_status" "DEVICE_SIZE_SECTORS=$obs_sysfs_size" "DEVICE_PID=$obs_sysfs_pid" "SYSFS_REASON=$obs_sysfs_reason" "LOCAL_STATE_SOURCE=sysfs_post_hook" || :
 }
 obs_read_native_handoff() {
     local -A rec=()
     [[ $obs_context_ok == yes ]] && obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 1
     obs_valid_invocation "${obs_ctx[invocation]}" || return 1
-    obs_read_fields rec id boot session invocation executed result code status pid reason < "$run_dir/observation.native" 2>/dev/null || return 1
+    obs_read_fields rec id boot session invocation executed result code status pid reason 2>/dev/null < "$run_dir/observation.native" || return 1
     [[ ${rec[id]} == "$obs_id" && ${rec[boot]} == "$boot_id" && ${rec[session]} == "$session" && ${rec[invocation]} == "${obs_ctx[invocation]}" ]] || return 1
-    case ${rec[executed]}:${rec[result]} in yes:success|yes:failed|yes:signaled|no:not_executed|unknown:unknown) ;; *) return 1;; esac
+    case ${rec[executed]}:${rec[result]} in yes:success|yes:failed|yes:signaled|yes:started_no_result|no:not_executed|unknown:unknown) ;; *) return 1;; esac
     native=${rec[result]}; native_executed=${rec[executed]}; native_code=${rec[code]}; native_status=${rec[status]}; native_pid=${rec[pid]}; native_reason=${rec[reason]}; native_invocation=${rec[invocation]}
 }
 obs_worker() {
     dev=$1 obs_action=$2 obs_stage=$3 obs_phase=$4
     [[ $dev =~ ^nbd(0|[1-9][0-9]*)$ && $EUID == 0 ]] || return 2
-    case $obs_action in init|baseline|snapshot|kernel|hook|bind) ;; *) return 2;; esac
+    case $obs_action in init|hook|bind) ;; *) return 2;; esac
     umask 077
     run_dir=${NBD_MONITOR_RUN_DIR:-/run/nbd-monitor}/$dev
     [[ $run_dir == /* ]] || return 2
@@ -722,21 +384,11 @@ obs_worker() {
     if [[ $obs_context_ok == yes && $obs_locked != yes ]]; then
         obs_emit "$obs_phase" "$obs_stage" observation_lock_busy || :
     fi
-    if [[ $obs_action == bind ]]; then obs_bind_invocation || :; return 0; fi
-    if [[ $obs_action == hook ]]; then obs_hook_native_result || :; fi
-    if [[ $obs_action == baseline || $obs_action == snapshot || $obs_action == hook ]]; then obs_snapshot || :; fi
-    # The pre-READY evidence window is irreversible; capture it first.
-    if [[ $obs_action == init ]]; then obs_preconnect || :; fi
-    obs_kernel || :
-    if [[ $obs_stage == disconnect-final ]]; then
-        local native=unknown native_executed=unknown native_code=unknown native_status=unknown native_pid=unknown native_reason=handoff_unavailable native_invocation=unknown
-        obs_read_native_handoff || :
-        obs_emit exit disconnect-final exit_evidence_summary "NATIVE_STOP_RESULT=$native" "NATIVE_STOP_EXECUTED=$native_executed" "NATIVE_STOP_CODE=$native_code" "NATIVE_STOP_STATUS=$native_status" "NATIVE_STOP_PID=$native_pid" "NATIVE_FACT_REASON=$native_reason" "NATIVE_INVOCATION_ID=$native_invocation" \
-            "DEVICE_STATUS=${obs_summary_device:-unknown}" "DEVICE_SIZE_SECTORS=${obs_summary_size:-unknown}" "CHECK_RC=${obs_summary_check_rc:-unknown}" \
-            "TCP_MAPPING=unverified" "TCP_RESULT=${obs_summary_tcp:-unknown}" \
-            "DISCONNECT_OBSERVED=${obs_summary_disc:-unknown}" "DISCONNECT_SEND_ERROR_OBSERVED=${obs_summary_senderr:-unknown}" \
-            "SOCKET_SHUTDOWN_OBSERVED=${obs_summary_shutdown:-unknown}" "CAPACITY_ZERO_OBSERVED=${obs_summary_zero:-unknown}" "KERNEL_EVIDENCE_GAP=${obs_summary_gap:-unknown}" || :
-    fi
+    case $obs_action in
+        bind) obs_bind_invocation || : ;;
+        hook) obs_hook_native_result || : ;;
+        init) obs_preconnect || : ;;
+    esac
     return 0
 }
 
@@ -1081,7 +733,7 @@ rescue_detach() {
     return 1
 }
 
-# P1 hook is deliberately dispatched before config/session loading and business locks.
+# M0 hook is deliberately dispatched before config/session loading and business locks.
 if [[ ${1:-} == _observe ]]; then
     (($# == 5)) || exit 2
     obs_worker "$2" "$3" "$4" "$5"
@@ -1110,7 +762,7 @@ case $mode in run|disconnect|report) ;; *) usage ;; esac
 
 # Observation-only bookkeeping; does not write business state.
 obs_id=unknown; obs_invocation=unknown; failure_reason=none
-obs_exit_started=no; obs_disconnect_entered=no; obs_close_attempts=0; obs_close_waits=0; obs_close_no_reply=0
+obs_local_state=unknown; obs_disconnect_entered=no; obs_close_attempts=0; obs_close_waits=0; obs_close_no_reply=0
 obs_close_outcome=not_attempted; obs_close_last=none; obs_rescue=not_evaluated
 obs_close_started_at=unknown
 obs_final() {
@@ -1119,12 +771,15 @@ obs_final() {
     if [[ $mode == disconnect ]]; then
         # A failed close may leave an old valid session intact, as before.
         # Never infer close success from the process exit status.
-        obs_emit exit disconnect monitor_disconnect_finished "MONITOR_RC=$rc" "REASON=$failure_reason" \
+        local native=unknown native_executed=unknown native_code=unknown native_status=unknown native_pid=unknown native_reason=handoff_unavailable native_invocation=unknown
+        if [[ $obs_disconnect_entered == yes ]]; then obs_read_native_handoff || :; fi
+        obs_emit exit disconnect exit_evidence_summary "MONITOR_RC=$rc" "REASON=$failure_reason" \
+            "NATIVE_STOP_RESULT=$native" "NATIVE_STOP_EXECUTED=$native_executed" "NATIVE_STOP_CODE=$native_code" "NATIVE_STOP_STATUS=$native_status" "NATIVE_STOP_PID=$native_pid" "NATIVE_FACT_REASON=$native_reason" "NATIVE_INVOCATION_ID=$native_invocation" \
+            "DEVICE_STATUS=$obs_local_state" "LOCAL_STATE_SOURCE=last_control_check" \
             "DISCONNECT_ENTERED=$obs_disconnect_entered" "CLOSE_OUTCOME=$obs_close_outcome" "CLOSE_LAST_REPLY=$obs_close_last" \
             "CLOSE_ATTEMPTS=$obs_close_attempts" "CLOSE_WAITS=$obs_close_waits" "CLOSE_NO_REPLY=$obs_close_no_reply" \
             "CLOSE_STARTED_EPOCH=$obs_close_started_at" "RESCUE_OUTCOME=$obs_rescue" \
             "DETACH_RESULT=${detach_result:-unknown}" "DETACH_COUNT=${detach_count:-0}" || :
-        if [[ $obs_disconnect_entered == yes ]]; then obs_call 1.8s snapshot disconnect-final exit || :; fi
     elif [[ $mode == run && $rc != 0 ]]; then
         obs_emit runtime run monitor_run_failed "MONITOR_RC=$rc" "REASON=$failure_reason" || :
     fi
@@ -1188,13 +843,7 @@ if [[ $mode == report ]]; then
     fi
     if [[ -n ${session:-} ]] && obs_context_matches; then
         printf 'observation_id=%s\n' "${obs_ctx[id]}"
-        for obs_file in observation.baseline observation.latest kernel.cursor; do
-            if [[ -r $run_dir/$obs_file ]] && grep -Fxq "observation_id=${obs_ctx[id]}" "$run_dir/$obs_file"; then
-                printf 'observation_file=%s\n' "$run_dir/$obs_file"
-            elif [[ $obs_file == kernel.cursor && -r $run_dir/$obs_file ]] && grep -Fxq "id=${obs_ctx[id]}" "$run_dir/$obs_file"; then
-                printf 'observation_file=%s\n' "$run_dir/$obs_file"
-            fi
-        done
+        printf 'native_invocation_id=%s\n' "${obs_ctx[invocation]}"
     fi
     exit 0
 fi
@@ -1242,6 +891,7 @@ if [[ $mode == run ]]; then
             sleep 1
         done
         [[ $got_previous == yes ]] || log 'previous 无有效回复：上轮结果未知（不等于 none）'
+        if [[ $got_previous == yes ]]; then obs_emit startup run previous_result "RESULT=$reply" "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" || :; else obs_emit startup run previous_result "RESULT=unknown" "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" || :; fi
 
     fi
 
@@ -1287,8 +937,7 @@ if [[ $mode == run ]]; then
         # Bind only after registration, using independently checked evidence.
         obs_write_context || obs_emit startup run observation_runtime_write_failed "PATH=observation.state" || :
         obs_emit startup run session_created "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" \
-            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-B" || :
-        : # baseline captured immediately after register
+            "NATIVE_INVOCATION_ID=$obs_invocation" "CONNECTION_PID=$current_pid" "MONITOR_VERSION=v0.4.2-M0" || :
     fi
 
     if [[ $recovered == yes ]]; then
@@ -1320,7 +969,6 @@ if [[ $mode == run ]]; then
     exec {run_fd}>&-
     count=0
     detached=no
-    if [[ $recovered == no ]]; then obs_call 2s baseline run startup || :; fi
     obs_call 2.2s bind run startup || :
     obs_last_device=connected
     obs_last_heartbeat=none
@@ -1331,11 +979,9 @@ if [[ $mode == run ]]; then
             exit 0
         fi
         observed_device=$(device_status)
-        obs_snapshot_needed=no
         if [[ $observed_device != "$obs_last_device" ]]; then
             obs_emit runtime run device_state_changed "BEFORE=$obs_last_device" "AFTER=$observed_device" || :
             obs_last_device=$observed_device
-            obs_snapshot_needed=yes
         fi
         case $observed_device in
             disconnected)
@@ -1386,25 +1032,8 @@ if [[ $mode == run ]]; then
                 log '心跳观测写入未取得短锁，保留旧记录供检查'
             fi
         fi
-        # Poll stop state only as an observation trigger. Existing heartbeat
-        # and device logic above retains priority and all original conditions.
-        if [[ $obs_exit_started == no ]] && (( count % 2 == 0 )); then
-            obs_native_state=$(timeout --foreground --kill-after=0.1s 0.4s "$systemctl_bin" show --value -p ActiveState "nbd@$dev.service" 2>/dev/null) || obs_native_state=unknown
-            if [[ $obs_native_state == deactivating ]]; then
-                obs_exit_started=yes; obs_snapshot_needed=yes
-                obs_emit exit run native_stop_seen "ACTIVE_STATE=$obs_native_state" || :
-            fi
-        fi
-        if [[ $observed_device == disconnected ]]; then obs_exit_started=yes; fi
-        if [[ $obs_snapshot_needed == yes ]]; then
-            obs_phase=runtime; [[ $obs_exit_started != yes ]] || obs_phase=exit
-            obs_call 2s snapshot run "$obs_phase" || :
-        elif (( count % heartbeat_interval_sec == 0 )); then
-            obs_phase=runtime; [[ $obs_exit_started != yes ]] || obs_phase=exit
-            obs_call 1.5s kernel run "$obs_phase" || :
-        fi
         # Retry only recoverable unknown bindings, after ordinary business.
-        if [[ $obs_exit_started == no && $observed_device == connected ]] && (( count > 0 && count % 30 == 0 )); then
+        if [[ $detached == no && $observed_device == connected ]] && (( count > 0 && count % 30 == 0 )); then
             if obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == unknown ]] && obs_binding_retryable; then
                 obs_call 2.2s bind run runtime || :
             fi
@@ -1420,7 +1049,8 @@ load_state || die '没有可供交接的 session 状态'
    ${saved[host]} == "$data_host" && ${saved[port]} == "$data_port" && \
    ${saved[export]} == "$data_export" ]] || die '状态与当前配置不匹配'
 session=${saved[session]}
-if obs_context_matches; then obs_id=${obs_ctx[id]}; fi
+obs_context_ok=no
+if obs_context_matches; then obs_id=${obs_ctx[id]}; obs_context_ok=yes; fi
 load_health
 if [[ ${saved[phase]} == closed ]]; then
     log "session=$session 本地已标记 closed；不执行第二次收尾"
@@ -1430,19 +1060,21 @@ active_state=$($systemctl_bin show --value -p ActiveState "nbd@$dev.service") ||
 [[ $active_state == inactive || $active_state == failed ]] || die "原生 NBD 单元仍为 $active_state；必须先完成原生 stop"
 obs_disconnect_entered=yes
 obs_emit exit disconnect monitor_disconnect_started "NATIVE_ACTIVE_STATE=$active_state" "DETACH_ENABLED=$detach_enabled" || :
-obs_call 1.6s snapshot disconnect-start exit || :
 start=$SECONDS
-if [[ $(device_status) != disconnected ]]; then
+obs_local_state=$(device_status)
+if [[ $obs_local_state != disconnected ]]; then
     log '原生 NBD 已停止，但尚未确认设备归零；进入有限补做检查'
     obs_rescue=required
     if rescue_detach "$start"; then obs_rescue=$detach_result; else
         obs_rescue=$detach_result; obs_close_outcome=skipped_device_not_disconnected
-        die "设备仍未安全解除；状态=$(device_status)，拒绝发送 zero=yes"
+        obs_local_state=$(device_status)
+        die "设备仍未安全解除；状态=$obs_local_state，拒绝发送 zero=yes"
     fi
 else
     obs_rescue=not_required
 fi
-if [[ $(device_status) != disconnected ]]; then
+obs_local_state=$(device_status)
+if [[ $obs_local_state != disconnected ]]; then
     obs_close_outcome=skipped_device_not_disconnected
     die '设备状态不是 disconnected，不能发送 zero=yes'
 fi
