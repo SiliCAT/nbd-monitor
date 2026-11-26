@@ -1,5 +1,5 @@
 #!/bin/bash
-# NBD 服务端初版：纯 Bash 业务脚本；不定义函数，不 source 状态或配置。
+# nbd-server v0.4.2-M0 (development) - minimal exit evidence; original v0.4 control retained
 # 入口：request | export PORT | finish PORT | scan
 # 配套六个单元文件见此前 nbd-server-systemd.tar.gz。
 # 依赖：Bash >= 4.3、flock、timeout、sha256sum、mkdir、mv、sleep、systemctl，
@@ -38,6 +38,113 @@ umask 077
 export LC_ALL=C
 shopt -s nullglob
 
+# M0: observations are never control conditions. Journal via stderr only.
+m0_emit() {
+    local event=$1 item key value payload tick=unknown
+    shift
+    IFS=' ' read -r tick _ < /proc/uptime || tick=unknown
+    printf -v payload 'nbd-m0 side=server event=%s boot=%q tick=%q epoch=%q port=%q run=%q' \
+        "$event" "${server_boot:-unknown}" "$tick" "${EPOCHREALTIME:-unknown}" "${port:-unknown}" "${run_id:-unknown}"
+    for item in "$@"; do
+        key=${item%%=*}; value=${item#*=}
+        [[ $key =~ ^[a-z_]+$ && $item == *=* ]] || continue
+        if ((${#value} > 2048)); then value=${value:0:2048}'[truncated]'; fi
+        printf -v payload '%s %s=%q' "$payload" "$key" "$value"
+    done
+    printf '%s\n' "$payload" >&2 || :
+    return 0
+}
+# Preserve the existing stdout response and its return code. No wire changes.
+m0_reply() {
+    local value=$1 rc=0
+    printf 'result=%s\n' "$value" || rc=$?
+    if [[ ${op:-} == close && ${message_ok:-no} == yes ]]; then
+        m0_emit close_reply "session=${message[session]-unknown}" "match=${m0_match:-unknown}" \
+            "zero_reported=${message[zero]-unknown}" "state_saved=${m0_saved:-unknown}" "reply=$value" "reply_write_rc=$rc"
+    fi
+    return "$rc"
+}
+# PID identity is scoped to this boot and the current proc view, not a lock.
+m0_proc_identity() {
+    local pid=$1 start=$2 line
+    local -a parts=()
+    m0_proc=unknown
+    [[ $pid =~ ^[1-9][0-9]*$ && $start =~ ^[0-9]+$ ]] || return 0
+    if [[ ! -e /proc/$pid ]]; then m0_proc=not_observed; return 0; fi
+    IFS= read -r line 2>/dev/null < "/proc/$pid/stat" || return 0
+    [[ $line == "$pid ("* && $line == *') '* ]] || return 0
+    read -r -a parts <<< "${line##*) }"
+    [[ ${parts[19]-} =~ ^[0-9]+$ ]] || return 0
+    if [[ ${parts[19]} != "$start" ]]; then m0_proc=pid_reused
+    elif [[ ${parts[0]-} == Z || ${parts[0]-} == X ]]; then m0_proc=exited_observed
+    else m0_proc=alive; fi
+    return 0
+}
+# ss -H -O -n -t -a -p -e, filtered by this data port. Only record owned sockets.
+m0_parse_ss() {
+    local raw=$1 pid=$2 line st rq sq local_ep peer_ep extra ino sk count=0 listeners=0 uncertain=no rec
+    local owner_re=",pid=$pid,fd=[0-9]+[),]"
+    m0_tcp=not_observed; m0_sockets=; m0_owned_count=0; m0_queue=unknown; m0_truncated=no
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        ((count+=1))
+        if ((count > 128)); then uncertain=yes; m0_truncated=yes; break; fi
+        IFS=$' \t' read -r st rq sq local_ep peer_ep extra <<< "$line"
+        if [[ ! $st =~ ^[A-Z][A-Z0-9-]*$ || ! $rq =~ ^[0-9]+$ || ! $sq =~ ^[0-9]+$ || $local_ep != *:* || $peer_ep != *:* ]]; then uncertain=yes; continue; fi
+        if [[ $st == LISTEN ]]; then
+            ((listeners+=1)); if ((listeners == 1)); then m0_queue=$rq; else m0_queue=unknown; fi
+            continue
+        fi
+        if [[ $extra =~ $owner_re ]]; then
+            ((m0_owned_count+=1)); ino=unknown; sk=unknown
+            if [[ $extra =~ (^|[[:space:]])ino:([0-9]+)($|[[:space:]]) ]]; then ino=${BASH_REMATCH[2]}; fi
+            if [[ $extra =~ (^|[[:space:]])sk:([[:xdigit:]]+)($|[[:space:]]) ]]; then sk=${BASH_REMATCH[2]}; fi
+            rec="$st,$local_ep,$peer_ep,ino=$ino,sk=$sk"
+            if ((m0_owned_count <= 8 && ${#m0_sockets}+${#rec}+1 <= 2048)); then
+                m0_sockets+="${m0_sockets:+;}$rec"
+            else m0_truncated=yes; fi
+        elif [[ $extra != *'users:('* && $st != TIME-WAIT ]]; then
+            uncertain=yes
+        fi
+    done <<< "$raw"
+    if ((m0_owned_count > 0)); then m0_tcp=run_owned_present
+    elif [[ $uncertain == yes ]]; then m0_tcp=unknown; fi
+    return 0
+}
+# Called only after the resource lock is released, after a request reply.
+# No persistent observation state. Bounded, read-only, best-effort.
+m0_residual() {
+    local trigger=$1 old_boot=$2 pid=$3 start=$4 saved_run=$5 current= raw= rc=unknown before
+    local m0_proc=unknown m0_tcp=unknown m0_sockets= m0_owned_count=0 m0_queue=unknown m0_truncated=no reason=identity_unverified
+    if [[ $old_boot == "$server_boot" && $saved_run == "$run_id" && $port =~ ^[1-9][0-9]{0,4}$ ]] &&
+       IFS= read -r current 2>/dev/null < "$resource_dir/current" && [[ $current == "$saved_run" ]]; then
+        m0_proc_identity "$pid" "$start"
+        before=$m0_proc
+        if [[ $before == alive ]]; then
+            rc=0
+            raw=$(timeout --foreground --kill-after=0.1s 0.5s /usr/bin/ss -H -O -n -t -a -p -e "( sport = :$port )" 2>/dev/null | /usr/bin/head -c 16385) || rc=$?
+            m0_proc_identity "$pid" "$start"
+            current=
+            if ! IFS= read -r current 2>/dev/null < "$resource_dir/current" || [[ $current != "$saved_run" || $m0_proc != alive ]]; then
+                reason=identity_changed; m0_proc=unknown
+            elif [[ $rc != 0 || ${#raw} -ge 16385 ]]; then
+                reason=query_failed_or_truncated
+                [[ ${#raw} -lt 16385 ]] || m0_truncated=yes
+            else
+                m0_parse_ss "$raw" "$pid"
+                reason=sampled
+            fi
+        else reason=process_not_verified_alive; fi
+    elif [[ $old_boot != "$server_boot" ]]; then reason=prior_boot; fi
+    m0_emit residual "trigger=$trigger" "session=${state[session]-unknown}" "run_boot=$old_boot" "pid=$pid" "pid_start=$start" \
+        "process_sample=$m0_proc" "process_record=${state[process]-unknown}" "phase=${state[phase]-unknown}" "fault=${state[fault]-none}" \
+        "last_heartbeat_tick=${state[last_tick]-unknown}" "close_seen=${state[close_seen]-unknown}" "zero_reported=${state[zero]-unknown}" \
+        "tcp=$m0_tcp" "tcp_scope=run_owner_not_session" "owned_count=$m0_owned_count" "sockets=$m0_sockets" \
+        "listener_recvq=$m0_queue" "query_rc=$rc" "reason=$reason" "truncated=$m0_truncated"
+    return 0
+}
+
+
 mode=${1:-}
 if [[ $mode == --help || $mode == -h || -z $mode ]]; then
     printf '%s\n' \
@@ -50,7 +157,7 @@ fi
 case $mode in request|export|finish|scan) ;; *) printf '未知入口：%s\n' "$mode" >&2; exit 2 ;; esac
 if (( EUID != 0 )); then
     printf '本脚本需要 root 身份运行。\n' >&2
-    [[ $mode != request ]] || printf 'result=error\n'
+    [[ $mode != request ]] || m0_reply error
     exit 1
 fi
 
@@ -63,17 +170,17 @@ systemctl_bin=${NBD_SERVER_SYSTEMCTL:-systemctl}
 for directory in "$state_dir" "$runtime_dir"; do
     if [[ $directory != /* ]]; then
         printf '状态目录必须是绝对路径：%s\n' "$directory" >&2
-        [[ $mode != request ]] || printf 'result=error\n'
+        [[ $mode != request ]] || m0_reply error
         exit 1
     fi
 done
 if ! mkdir -p -- "$state_dir/resources" "$state_dir/sessions" "$state_dir/previous" "$runtime_dir"; then
-    [[ $mode != request ]] || printf 'result=error\n'
+    [[ $mode != request ]] || m0_reply error
     exit 1
 fi
 if ! IFS= read -r server_boot < /proc/sys/kernel/random/boot_id; then
     printf '无法读取本机启动标识。\n' >&2
-    [[ $mode != request ]] || printf 'result=error\n'
+    [[ $mode != request ]] || m0_reply error
     exit 1
 fi
 
@@ -122,9 +229,10 @@ if [[ $mode == request ]]; then
     fi
     if [[ $message_ok != yes ]]; then
         printf '控制请求不完整、字段不符或读取超时。\n' >&2
-        printf 'result=error\n'
+        m0_reply error
         exit 0
     fi
+    if [[ $op == close ]]; then m0_emit close_received "session=${message[session]}" "zero_reported=${message[zero]}" || :; fi
 fi
 
 # [02] 解析配置；heartbeat/close/finish/scan 使用本轮配置，不依赖当前配置文件。
@@ -193,7 +301,7 @@ fi
 if [[ -n $port ]]; then
     if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || ((10#$port > 65535)); then
         printf '数据端口无效：%s\n' "$port" >&2
-        [[ $mode != request ]] || printf 'result=error\n'
+        [[ $mode != request ]] || m0_reply error
         exit 1
     fi
 fi
@@ -207,35 +315,35 @@ if [[ $mode == request && ( $op == register || $op == heartbeat || $op == close 
                 port=$index_port; run_id=$index_run; known_session=yes
             else
                 printf '登记 session 与原数据端口冲突。\n' >&2
-                printf 'result=error\n'; exit 0
+                m0_reply error; exit 0
             fi
         else
             printf '会话索引损坏。\n' >&2
-            printf 'result=error\n'; exit 0
+            m0_reply error; exit 0
         fi
     elif [[ $op != register ]]; then
         printf '未找到对应会话。\n' >&2
-        printf 'result=error\n'; exit 0
+        m0_reply error; exit 0
     fi
 fi
 if [[ $mode == request && ( $op == previous || $op == register ) ]]; then
     if [[ $known_session != yes && ( $config_ok != yes || ! ${configured_ports[$port]+present} ) ]]; then
         printf '配置中没有可用的数据入口：%s\n' "$port" >&2
-        printf 'result=error\n'; exit 0
+        m0_reply error; exit 0
     fi
     # 已登记重试使用原运行记录；新登记/previous 核对当前实际配置。
     if [[ $known_session != yes && ${message[export]} != "${config[$port\|export]-}" ]]; then
         printf '数据端口 %s 的导出名不匹配。\n' "$port" >&2
-        printf 'result=error\n'; exit 0
+        m0_reply error; exit 0
     fi
     hash_text=$(printf '%s\n' "${message[client]}" "${message[host]}" "$port" "${message[export]}" | sha256sum) || exit 1
     previous_index=$state_dir/previous/${hash_text%% *}
     if [[ $op == previous ]]; then
-        if [[ ! -f $previous_index ]]; then printf 'result=none\n'; exit 0; fi
+        if [[ ! -f $previous_index ]]; then m0_reply none; exit 0; fi
         { IFS= read -r index_port; IFS= read -r index_run; } < "$previous_index"
         if [[ $index_port != "$port" || ! $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then
             printf '历史索引损坏。\n' >&2
-            printf 'result=error\n'; exit 0
+            m0_reply error; exit 0
         fi
         run_id=$index_run
     fi
@@ -278,12 +386,12 @@ if [[ $mode == scan ]]; then
     flock -n "$scan_fd" || exit 0
 fi
 if [[ $mode == request && $op == register ]]; then
-    exec {session_fd}> "$runtime_dir/session.lock" || { printf 'result=error\n'; exit 0; }
-    if ! flock -w 1 "$session_fd"; then printf 'result=error\n'; exit 0; fi
+    exec {session_fd}> "$runtime_dir/session.lock" || { m0_reply error; exit 0; }
+    if ! flock -w 1 "$session_fd"; then m0_reply error; exit 0; fi
     # 在索引锁下重查，覆盖并发的首次登记。
     if [[ -f $session_index && $known_session != yes ]]; then
         { IFS= read -r index_port; IFS= read -r index_run; } < "$session_index"
-        if [[ $index_port != "$port" || ! $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then printf 'result=error\n'; exit 0; fi
+        if [[ $index_port != "$port" || ! $index_run =~ ^[a-fA-F0-9]{32}$ ]]; then m0_reply error; exit 0; fi
         run_id=$index_run; known_session=yes
     fi
 fi
@@ -304,7 +412,7 @@ overall_rc=0
 for port in "${work_ports[@]}"; do
     resource_dir=$state_dir/resources/$port
     if ! mkdir -p -- "$resource_dir/runs"; then
-        [[ $mode != request ]] || printf 'result=error\n'
+        [[ $mode != request ]] || m0_reply error
         exit 1
     fi
     work_again=yes
@@ -315,10 +423,11 @@ for port in "${work_ports[@]}"; do
         changed=no
         post_action=
         reply_after_write=no
+        m0_capture=; m0_match=unknown; m0_saved=unknown; m0_finish_event=no
         exec {resource_fd}> "$runtime_dir/port-$port.lock" || exit 1
         if ! flock -w 1 "$resource_fd"; then
             exec {resource_fd}>&-
-            if [[ $mode == request ]]; then printf 'result=error\n'; exit 0; fi
+            if [[ $mode == request ]]; then m0_reply error; exit 0; fi
             if [[ $mode == finish ]]; then sleep 1; work_again=yes; continue; fi
             overall_rc=1; break
         fi
@@ -331,7 +440,7 @@ for port in "${work_ports[@]}"; do
             exec {resource_fd}>&-
             if [[ $mode == request ]]; then
                 [[ $op != register ]] || result=wait
-                printf 'result=%s\n' "$result"; exit 0
+                m0_reply "$result"; exit 0
             fi
             printf '端口 %s 缺少本轮运行标识。\n' "$port" >&2
             overall_rc=1; break
@@ -419,7 +528,7 @@ for port in "${work_ports[@]}"; do
         elif [[ ${state[run]-} != "$run_id" || ${state[port]-} != "$port" ]]; then
             printf '端口 %s 的运行记录不存在或不一致。\n' "$port" >&2
             exec {resource_fd}>&-
-            if [[ $mode == request ]]; then printf 'result=error\n'; exit 0; fi
+            if [[ $mode == request ]]; then m0_reply error; exit 0; fi
             overall_rc=1; break
         fi
 
@@ -442,6 +551,10 @@ for port in "${work_ports[@]}"; do
         fi
 
         if [[ $mode == request ]]; then
+            if [[ $op == close ]]; then
+                m0_match=no
+                if [[ ${state[session]-} == "${message[session]}" ]]; then m0_match=yes; fi
+            fi
             case $op in
                 previous)
                     if [[ ${state[client]-} != "${message[client]}" || ${state[host]-} != "${message[host]}" || ${state[export]-} != "${message[export]}" ]]; then
@@ -488,6 +601,8 @@ for port in "${work_ports[@]}"; do
                             changed=yes
                         fi
                     else
+                        m0_first_close=no
+                        if [[ ${state[close_seen]-} != yes || ${state[zero]-} != yes ]]; then m0_first_close=yes; fi
                         state[zero]=${message[zero]}
                         state[close_seen]=yes
                         if [[ ${state[phase]-} != finished ]]; then
@@ -499,6 +614,7 @@ for port in "${work_ports[@]}"; do
                         fi
                         changed=yes
                         if [[ ${state[phase]-} != finished ]] && (( ${state[closing_deadline]:-0} > 0 && now_tick >= state[closing_deadline] )); then
+                            if [[ ${state[exit_result]-} != incomplete ]]; then m0_capture=closing_timeout; fi
                             [[ -n ${state[fault]-} ]] || state[fault]=closing_timeout
                             state[exit_result]=incomplete
                         fi
@@ -512,6 +628,7 @@ for port in "${work_ports[@]}"; do
                             fi
                         else result=wait
                         fi
+                        if [[ -z $m0_capture && $result == wait && ${message[zero]} == yes && $m0_first_close == yes && ${state[process]-} != exited ]]; then m0_capture=close_wait; fi
                     fi
                     ;;
             esac
@@ -542,6 +659,7 @@ for port in "${work_ports[@]}"; do
                 changed=yes
                 printf '端口 %s 的 qemu-nbd 已退出：%s/%s/%s。\n' "$port" "${state[service_result]}" "${state[exit_code]}" "${state[exit_status]}" >&2
             fi
+            if [[ $finish_recorded != yes ]]; then m0_finish_event=yes; fi
             finish_recorded=yes
             if [[ -n ${state[fault]-} || ${state[exit_result]-} == incomplete || ${state[exit_result]-} == abnormal ]]; then
                 [[ ${state[exit_result]-} == incomplete ]] || state[exit_result]=abnormal
@@ -599,6 +717,9 @@ for port in "${work_ports[@]}"; do
                 (( now_tick - state[last_tick] < state[heartbeat_timeout_sec] )) || timeout_reason=heartbeat_timeout
             fi
             if [[ -n $timeout_reason ]]; then
+                if [[ ( $alive == yes && ${state[process]-} != exited && ${state[reset_result]-} == none ) ||
+                      ( ( $alive == no || ${state[process]-} == exited ) && ${state[scan_dead_logged]-} != yes ) ||
+                      ( $timeout_reason == closing_timeout && ${state[exit_result]-} != incomplete ) ]]; then m0_capture=$timeout_reason; fi
                 [[ -n ${state[fault]-} ]] || state[fault]=$timeout_reason
                 if [[ $timeout_reason == closing_timeout ]]; then state[exit_result]=incomplete; fi
                 if [[ $alive == no || ${state[process]-} == exited ]]; then
@@ -624,14 +745,16 @@ for port in "${work_ports[@]}"; do
 
         # [10] 原子保存本轮状态。不会执行配置/状态文件中的任何内容。
         if [[ $changed == yes ]]; then
+            m0_saved=no
             state_lines=()
             for key in "${!state[@]}"; do state_lines+=("$key=${state[$key]}"); done
             if ! printf '%s\n' "${state_lines[@]}" > "$state_file.tmp.$$" || ! mv -f -- "$state_file.tmp.$$" "$state_file"; then
                 printf '保存端口 %s 的本轮状态失败。\n' "$port" >&2
                 exec {resource_fd}>&-
-                [[ $mode != request ]] || printf 'result=error\n'
+                [[ $mode != request ]] || m0_reply error
                 exit 1
             fi
+            m0_saved=yes
         fi
         if [[ $mode == export ]]; then
             if ! printf '%s\n' "$run_id" > "$resource_dir/current.tmp.$$" || ! mv -f -- "$resource_dir/current.tmp.$$" "$resource_dir/current"; then
@@ -644,14 +767,30 @@ for port in "${work_ports[@]}"; do
             for index_file in "$session_index" "$previous_index"; do
                 if ! printf '%s\n' "${index_lines[@]}" > "$index_file.tmp.$$" || ! mv -f -- "$index_file.tmp.$$" "$index_file"; then
                     printf '保存登记索引失败。\n' >&2
-                    exec {resource_fd}>&-; printf 'result=error\n'; exit 1
+                    exec {resource_fd}>&-; m0_reply error; exit 1
                 fi
             done
         fi
         exec {resource_fd}>&-
 
-        if [[ $mode == request ]]; then printf 'result=%s\n' "$result"; exit 0; fi
+        if [[ $mode == request ]]; then
+            m0_reply "$result"
+            if [[ $op == register && $result == ok ]]; then
+                m0_emit registered "session=${state[session]-unknown}" "client=${state[client]-unknown}" "export=${state[export]-unknown}" "pid=${state[pid]-unknown}" "pid_start=${state[pid_start]-unknown}" || :
+            fi
+            if [[ -n $m0_capture ]]; then m0_residual "$m0_capture" "${state[boot]-unknown}" "${state[pid]-unknown}" "${state[pid_start]-unknown}" "${state[run]-unknown}" || :; fi
+            exit 0
+        fi
+        if [[ $mode == scan && -n $m0_capture ]]; then
+            m0_residual "$m0_capture" "${state[boot]-unknown}" "${state[pid]-unknown}" "${state[pid_start]-unknown}" "${state[run]-unknown}" || :
+        fi
+        if [[ $mode == finish && ( $m0_finish_event == yes || $post_action != finish_wait ) ]]; then
+            m0_emit finish "session=${state[session]-unknown}" "process=${state[process]-unknown}" "service_result=${state[service_result]-unknown}" \
+                "exit_code=${state[exit_code]-unknown}" "exit_status=${state[exit_status]-unknown}" "phase=${state[phase]-unknown}" \
+                "exit_result=${state[exit_result]-unknown}" "close_seen=${state[close_seen]-unknown}" "zero_reported=${state[zero]-unknown}" "fault=${state[fault]-none}" || :
+        fi
         if [[ $post_action == exec_export ]]; then
+            m0_emit export_started "export=${state[export]-unknown}" "pid=${state[pid]-unknown}" "pid_start=${state[pid_start]-unknown}" || :
             qemu_args=(--format=qcow2 --shared=1 "--export-name=${effective[export]}")
             [[ ${effective[read_only]} != yes ]] || qemu_args+=(--read-only)
             [[ ${effective[write_mode]} != temporary || ${effective[read_only]} == yes ]] || qemu_args+=(--snapshot)
@@ -819,6 +958,7 @@ for port in "${work_ports[@]}"; do
             fi
             exec {resource_fd}>&-
             printf '端口 %s 重置结束：%s %s。\n' "$port" "${state[reset_result]}" "${state[reset_error]-}" >&2
+            m0_emit reset_finished "session=${state[session]-unknown}" "reset_result=${state[reset_result]}" "reset_error=${state[reset_error]-none}" || :
         fi
     done
 done
