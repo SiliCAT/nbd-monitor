@@ -1,5 +1,5 @@
 #!/bin/bash
-# nbd-monitor v0.4.2-P1 (development) - local exit observation; original v0.4 behavior retained
+# nbd-monitor v0.4.2-P1-R-A (development) - local exit observation; original v0.4 behavior retained
 # 仅支持 TCP nbdtab、单客户端单连接、普通文件系统测试；不支持 swap。
 # Type=notify 在 previous 完成后、真实数据连接前报告 READY。
 # 原生 nbd@ 先停止，monitor ExecStop=disconnect 随后核验；仅显式启用后有限补做 detach。
@@ -81,9 +81,11 @@ obs_read_context() {
     for key in id boot client session host port export invocation; do
         [[ ${obs_ctx[$key]+x} ]] || return 1
     done
-    [[ ${obs_ctx[id]} =~ ^[0-9a-fA-F-]{36}$ && ${obs_ctx[boot]} == "$boot_id" ]] || return 1
-    [[ ${obs_ctx[session]} == unknown || ${obs_ctx[session]} =~ ^[0-9a-fA-F-]{36}$ ]] || return 1
+    local uuid_re='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
+    [[ $boot_id =~ $uuid_re && ${obs_ctx[id]} =~ $uuid_re && ${obs_ctx[boot]} == "$boot_id" ]] || return 1
+    [[ ${obs_ctx[session]} == unknown || ${obs_ctx[session]} =~ $uuid_re ]] || return 1
     [[ ${obs_ctx[port]} =~ ^[0-9]{1,5}$ ]] || return 1
+    [[ ${obs_ctx[invocation]} == unknown ]] || obs_valid_invocation "${obs_ctx[invocation]}" || return 1
 }
 obs_write_context() {
     obs_atomic "$run_dir/observation.state" \
@@ -94,11 +96,120 @@ obs_context_matches() {
     obs_read_context && [[ ${obs_ctx[client]} == "$client_id" && ${obs_ctx[session]} == "${session:-unknown}" && \
         ${obs_ctx[host]} == "$data_host" && ${obs_ctx[port]} == "$data_port" && ${obs_ctx[export]} == "$data_export" ]]
 }
-obs_native_invocation() {
-    local v
-    v=$(timeout --foreground --kill-after=0.1s 0.5s "$systemctl_bin" show --value -p InvocationID "nbd@$dev.service" 2>/dev/null) || v=unknown
-    [[ $v =~ ^[0-9a-fA-F]{32}$ && $v != 00000000000000000000000000000000 ]] || v=unknown
-    printf '%s' "$v"
+# Observation-only identity helpers. The existing observation.state schema
+# remains unchanged; new sidecars are scoped by observation/boot/session.
+obs_valid_invocation() {
+    [[ $1 =~ ^[0-9a-fA-F]{32}$ && $1 != 00000000000000000000000000000000 ]]
+}
+obs_read_fields() {
+    local -n dest=$1
+    shift
+    local line key
+    dest=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line == *=* ]] || return 1
+        key=${line%%=*}
+        [[ $key =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ && " $* " == *" $key "* ]] || return 1
+        [[ ! ${dest[$key]+x} ]] || return 1
+        dest[$key]=${line#*=}
+    done
+    for key in "$@"; do [[ ${dest[$key]+x} ]] || return 1; done
+}
+# Reuse the pre-READY worker's existing outer budget. No evidence means no
+# automatic binding, not a new startup condition.
+obs_preconnect() {
+    local rc=0 size output
+    [[ $obs_context_ok == yes && $obs_locked == yes && $session == unknown ]] || return 0
+    obs_valid_invocation "${INVOCATION_ID:-unknown}" || return 0
+    size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
+    output=$(timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" 2>/dev/null) || rc=$?
+    [[ $rc == 1 && $size == 0 ]] || return 0
+    obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 0
+    obs_atomic "$run_dir/observation.preconnect" "id=$obs_id" "boot=$boot_id" "monitor_invocation=$INVOCATION_ID" || :
+}
+obs_binding_connection() {
+    local -A st=() conn=()
+    local live size
+    obs_read_fields st client host port export session boot phase < "$run_dir/session.state" || return 1
+    [[ ${st[client]} == "$client_id" && ${st[host]} == "$data_host" && ${st[port]} == "$data_port" && ${st[export]} == "$data_export" && ${st[session]} == "$session" && ${st[boot]} == "$boot_id" && ${st[phase]} == running ]] || return 1
+    obs_read_fields conn session pid < "$run_dir/connection.state" || return 1
+    [[ ${conn[session]} == "$session" && ${conn[pid]} =~ ^[1-9][0-9]*$ ]] || return 1
+    live=$(timeout --foreground --kill-after=0.1s 0.25s "${NBD_MONITOR_NBD_CLIENT:-/usr/sbin/nbd-client}" -c "/dev/$dev" 2>/dev/null) || return 1
+    size=$(obs_attr "${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}/$dev/size")
+    [[ $live == "${conn[pid]}" && $size =~ ^[0-9]+$ && $size != 0 ]] || return 1
+    printf '%s' "$live"
+}
+obs_binding_note() {
+    local reason=$1 rc=$2 candidate=$3 bound=$4 previous= line
+    if [[ -r $run_dir/observation.bind-status ]]; then
+        IFS= read -r previous < "$run_dir/observation.bind-status" || :
+    fi
+    line="$obs_id $reason $rc $candidate $bound"
+    [[ $line != "$previous" ]] || return 0
+    obs_emit "$obs_phase" "$obs_stage" native_invocation_binding "BIND_REASON=$reason" "QUERY_RC=$rc" "CANDIDATE_INVOCATION_ID=$candidate" "NATIVE_INVOCATION_ID=$bound" || :
+    obs_atomic "$run_dir/observation.bind-status" "$line" || :
+}
+obs_bind_invocation() {
+    local -A anchor=() native=() monitor=()
+    local raw rc=0 first second candidate=unknown old
+    [[ $obs_context_ok == yes && $obs_locked == yes && $session != unknown ]] || return 0
+    obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 0
+    old=${obs_ctx[invocation]}
+    if [[ $old == unknown ]]; then
+        if ! obs_read_fields anchor id boot monitor_invocation < "$run_dir/observation.preconnect" 2>/dev/null ||
+           [[ ${anchor[id]:-} != "$obs_id" || ${anchor[boot]:-} != "$boot_id" || ${anchor[monitor_invocation]:-} != "${INVOCATION_ID:-unknown}" ]] ||
+           ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then
+            obs_binding_note preconnect_unverified unknown unknown "$old"; return 0
+        fi
+        if ! first=$(obs_binding_connection); then obs_binding_note connection_unverified unknown unknown "$old"; return 0; fi
+    fi
+    raw=$(timeout --foreground --kill-after=0.1s 0.4s "$systemctl_bin" show --all -p InvocationID -p ActiveState -p SubState -p ExecMainStartTimestampMonotonic "nbd@$dev.service" 2>/dev/null) || rc=$?
+    if ((rc != 0)); then obs_binding_note native_query_failed "$rc" unknown "$old"; return 0; fi
+    if ! obs_read_fields native InvocationID ActiveState SubState ExecMainStartTimestampMonotonic <<< "$raw" || ! obs_valid_invocation "${native[InvocationID]:-unknown}"; then
+        obs_binding_note native_identity_unavailable 0 unknown "$old"; return 0
+    fi
+    candidate=${native[InvocationID]}
+    if [[ $old != unknown ]]; then
+        if [[ $old != "$candidate" ]]; then obs_binding_note invocation_conflict 0 "$candidate" "$old"; fi
+        return 0
+    fi
+    if [[ ${native[ActiveState]} != active || ${native[SubState]} != exited || ! ${native[ExecMainStartTimestampMonotonic]} =~ ^[1-9][0-9]{0,17}$ ]]; then
+        obs_binding_note native_not_confirmed_active 0 "$candidate" "$old"; return 0
+    fi
+    rc=0
+    raw=$(timeout --foreground --kill-after=0.1s 0.4s "$systemctl_bin" show --all -p InvocationID -p ExecMainStartTimestampMonotonic "nbd-monitor@$dev.service" 2>/dev/null) || rc=$?
+    if ((rc != 0)); then obs_binding_note monitor_query_failed "$rc" "$candidate" "$old"; return 0; fi
+    if ! obs_read_fields monitor InvocationID ExecMainStartTimestampMonotonic <<< "$raw" ||
+       [[ ${monitor[InvocationID]:-} != "$INVOCATION_ID" || ! ${monitor[ExecMainStartTimestampMonotonic]:-} =~ ^[1-9][0-9]{0,17}$ ]] ||
+       (( native[ExecMainStartTimestampMonotonic] <= monitor[ExecMainStartTimestampMonotonic] )); then
+        obs_binding_note native_start_unverified 0 "$candidate" "$old"; return 0
+    fi
+    if ! second=$(obs_binding_connection) || [[ $first != "$second" ]] || ! obs_context_matches ||
+       [[ ${obs_ctx[id]} != "$obs_id" || ${obs_ctx[invocation]} != unknown ]]; then
+        obs_binding_note context_or_connection_changed 0 "$candidate" "$old"; return 0
+    fi
+    obs_invocation=$candidate
+    if obs_write_context; then
+        obs_ctx[invocation]=$candidate
+        obs_binding_note bound 0 "$candidate" "$candidate"
+    else obs_binding_note context_write_failed 0 "$candidate" "$old"; fi
+}
+# Hook association and native fact validation deliberately have separate results.
+obs_hook_context() {
+    client_id=unknown; session=unknown; obs_id=unknown; data_host=unknown; data_port=unknown; data_export=unknown
+    obs_context_ok=no; obs_context_reason=context_unavailable
+    if ! obs_valid_invocation "${INVOCATION_ID:-unknown}"; then obs_context_reason=hook_invocation_invalid
+    elif obs_read_context; then
+        if [[ ${obs_ctx[invocation]} == unknown ]]; then obs_context_reason=context_invocation_unknown
+        elif [[ ${obs_ctx[session]} == unknown ]]; then obs_context_reason=context_session_unknown
+        elif [[ ${obs_ctx[invocation]} != "$INVOCATION_ID" ]]; then obs_context_reason=invocation_mismatch
+        else
+            client_id=${obs_ctx[client]}; session=${obs_ctx[session]}; obs_id=${obs_ctx[id]}
+            data_host=${obs_ctx[host]}; data_port=${obs_ctx[port]}; data_export=${obs_ctx[export]}
+            obs_context_ok=yes; obs_context_reason=matched
+        fi
+    fi
+    return 0
 }
 # Worker has its own finite lifetime. No original business locks are acquired.
 obs_call() {
@@ -114,9 +225,11 @@ obs_call() {
     ) || rc=$?
     # Suppress repeated identical runtime worker failures, but record changes.
     local previous=${obs_call_status[$action]:-0}
+    local -a hook_fields=()
+    if [[ $action == hook ]]; then hook_fields=("NATIVE_INVOCATION_ID=${INVOCATION_ID:-unknown}" "CONTEXT_MATCH=${obs_context_ok:-no}" "CONTEXT_REASON=${obs_context_reason:-unknown}"); fi
     if ((rc != 0)); then
         if [[ $phase != runtime || $previous != "$rc" ]]; then
-            obs_emit "$phase" "$stage" observation_worker_failed "WORKER_RC=$rc" "ACTION=$action" || :
+            obs_emit "$phase" "$stage" observation_worker_failed "WORKER_RC=$rc" "ACTION=$action" "${hook_fields[@]}" || :
         fi
     elif [[ $previous != 0 ]]; then
         obs_emit "$phase" "$stage" observation_worker_recovered "ACTION=$action" || :
@@ -311,33 +424,75 @@ obs_kernel() {
             "DISCONNECT_OBSERVED=$disc" "DISCONNECT_SEND_ERROR_OBSERVED=$senderr" "SOCKET_SHUTDOWN_OBSERVED=$shutdown" "CAPACITY_ZERO_OBSERVED=$zero" || :
     fi
 }
+# Parse only the known, single Debian native ExecStop record. Unknown formats
+# remain raw evidence, never success. No observation/session identity required.
+obs_parse_native_stop() {
+    local raw=$1 rc=$2 hook_id=$3 stop
+    local -A props=()
+    local cmd_re='^\{ path=/usr/sbin/nbd-client ; argv\[\]=/usr/sbin/nbd-client -d /dev/'"$dev"' ; ignore_errors=(yes|no) ; start_time=\[([^]]+)\] ; stop_time=\[([^]]+)\] ; pid=([0-9]+) ; code=([^ ;]+) ; status=([^ ;]+) \}$'
+    local time_re='^[A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [^[:cntrl:]]+)?$'
+    local status_re='^(0|[1-9][0-9]*)(/[[:alnum:]_+-]+)?$'
+    native_executed=unknown; native_result=unknown; native_pid=unknown
+    native_code=unknown; native_status=unknown; native_start=unknown; native_end=unknown
+    native_query_invocation=unknown; native_reason=query_failed
+    ((rc == 0)) || return 0
+    native_reason=hook_invocation_invalid
+    obs_valid_invocation "$hook_id" || return 0
+    native_reason=invalid_properties
+    obs_read_fields props ExecStop InvocationID <<< "$raw" || return 0
+    native_query_invocation=${props[InvocationID]}
+    native_reason=invocation_mismatch
+    [[ $native_query_invocation == "$hook_id" ]] || return 0
+    native_reason=unrecognized_execstop
+    stop=${props[ExecStop]}
+    [[ $stop =~ $cmd_re ]] || return 0
+    local st=${BASH_REMATCH[2]} en=${BASH_REMATCH[3]} pid=${BASH_REMATCH[4]} code=${BASH_REMATCH[5]} status=${BASH_REMATCH[6]}
+    if [[ $st == n/a && $en == n/a && $pid == 0 && $code == '(null)' && ( $status == 0 || $status == 0/0 ) ]]; then
+        native_executed=no; native_result=not_executed; native_pid=0
+        native_code=$code; native_status=$status; native_start=$st; native_end=$en; native_reason=verified_not_executed
+        return 0
+    fi
+    native_reason=invalid_execution_record
+    [[ $st =~ $time_re && $en =~ $time_re && $pid =~ ^[1-9][0-9]*$ && $status =~ $status_re ]] || return 0
+    case $code in
+        exited) if [[ ${status%%/*} == 0 ]]; then native_result=success; else native_result=failed; fi ;;
+        killed|dumped) [[ ${status%%/*} != 0 ]] || return 0; native_result=signaled ;;
+        *) return 0 ;;
+    esac
+    native_executed=yes; native_pid=$pid; native_code=$code; native_status=$status
+    native_start=$st; native_end=$en; native_reason=verified_execution
+    return 0
+}
 obs_hook_native_result() {
-    local raw rc=0 result=unknown stop_code=unknown stop_status=unknown native_start=unknown native_end=unknown
+    local raw rc=0 native_executed native_result native_pid native_code native_status native_start native_end native_query_invocation native_reason
+    local handoff=unassociated
     raw=$(timeout --foreground --kill-after=0.1s 0.5s "$systemctl_bin" show -p ExecStop -p InvocationID "nbd@$dev.service" 2>/dev/null) || rc=$?
-    # Only classify a single executed native stop with matching invocation.
-    # The raw systemd record always remains the primary evidence.
-    if ((rc == 0)) && [[ $obs_context_ok == yes && $raw == *"InvocationID=$INVOCATION_ID"* && $raw != *'start_time=[n/a]'* && $raw != *'stop_time=[n/a]'* && $raw != *'} {'* && $raw == *"path=/usr/sbin/nbd-client ;"* && $raw == *"-d /dev/$dev ;"* ]]; then
-        if [[ $raw =~ pid=([1-9][0-9]*)[[:space:]]*\;[[:space:]]*code=([^[:space:]\;]+)[[:space:]]*\;[[:space:]]*status=([^[:space:]\;]+) ]]; then
-            stop_code=${BASH_REMATCH[2]}; stop_status=${BASH_REMATCH[3]}
-            case $stop_code:$stop_status in exited:0) result=success;; exited:*) result=failed;; killed:*|dumped:*) result=signaled;; esac
-            if [[ $raw =~ start_time=\[([^]]+)\] ]]; then native_start=${BASH_REMATCH[1]}; fi
-            if [[ $raw =~ stop_time=\[([^]]+)\] ]]; then native_end=${BASH_REMATCH[1]}; fi
-        fi
-    fi
-    # Native stop evidence has a single writer (the native ExecStopPost).
-    # It must not be lost just because the run sampler holds observe.lock.
+    obs_parse_native_stop "$raw" "$rc" "${INVOCATION_ID:-unknown}"
+    # Native hook is the single writer; never wait on observe.lock. Validate
+    # association again just before publishing the strictly scoped sidecar.
     if [[ $obs_context_ok == yes ]] && obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == "${INVOCATION_ID:-unknown}" ]]; then
-        obs_atomic "$run_dir/observation.native" "id=$obs_id" "result=$result" "code=$stop_code" "status=$stop_status" || :
+        handoff=write_failed
+        if obs_atomic "$run_dir/observation.native" "id=$obs_id" "boot=$boot_id" "session=$session" "invocation=$INVOCATION_ID" \
+            "executed=$native_executed" "result=$native_result" "code=$native_code" "status=$native_status" "pid=$native_pid" "reason=$native_reason"; then handoff=written; fi
     fi
-    obs_emit exit observe-stop native_stop_observed "NATIVE_STOP_RESULT=$result" "NATIVE_STOP_CODE=$stop_code" "NATIVE_STOP_STATUS=$stop_status" "NATIVE_STOP_START=$native_start" "NATIVE_STOP_END=$native_end" "NATIVE_INVOCATION_ID=${INVOCATION_ID:-unknown}" \
+    obs_emit exit observe-stop native_stop_observed "NATIVE_STOP_EXECUTED=$native_executed" "NATIVE_STOP_RESULT=$native_result" "NATIVE_STOP_PID=$native_pid" "NATIVE_STOP_CODE=$native_code" "NATIVE_STOP_STATUS=$native_status" "NATIVE_STOP_START=$native_start" "NATIVE_STOP_END=$native_end" "NATIVE_INVOCATION_ID=${INVOCATION_ID:-unknown}" "NATIVE_QUERY_INVOCATION_ID=$native_query_invocation" "NATIVE_FACT_REASON=$native_reason" \
         "NATIVE_SERVICE_RESULT=${SERVICE_RESULT:-unknown}" "NATIVE_MAIN_EXIT_CODE=${EXIT_CODE:-unknown}" \
         "NATIVE_MAIN_EXIT_STATUS=${EXIT_STATUS:-unknown}" "NATIVE_EXECSTOP_QUERY_RC=$rc" "NATIVE_EXECSTOP_RAW=$raw" \
-        "CONTEXT_MATCH=$obs_context_ok" || :
+        "CONTEXT_MATCH=$obs_context_ok" "CONTEXT_REASON=${obs_context_reason:-unknown}" "NATIVE_HANDOFF=$handoff" || :
+}
+obs_read_native_handoff() {
+    local -A rec=()
+    [[ $obs_context_ok == yes ]] && obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]] || return 1
+    obs_valid_invocation "${obs_ctx[invocation]}" || return 1
+    obs_read_fields rec id boot session invocation executed result code status pid reason < "$run_dir/observation.native" 2>/dev/null || return 1
+    [[ ${rec[id]} == "$obs_id" && ${rec[boot]} == "$boot_id" && ${rec[session]} == "$session" && ${rec[invocation]} == "${obs_ctx[invocation]}" ]] || return 1
+    case ${rec[executed]}:${rec[result]} in yes:success|yes:failed|yes:signaled|no:not_executed|unknown:unknown) ;; *) return 1;; esac
+    native=${rec[result]}; native_executed=${rec[executed]}; native_code=${rec[code]}; native_status=${rec[status]}; native_pid=${rec[pid]}; native_reason=${rec[reason]}; native_invocation=${rec[invocation]}
 }
 obs_worker() {
     dev=$1 obs_action=$2 obs_stage=$3 obs_phase=$4
     [[ $dev =~ ^nbd(0|[1-9][0-9]*)$ && $EUID == 0 ]] || return 2
-    case $obs_action in init|baseline|snapshot|kernel|hook) ;; *) return 2;; esac
+    case $obs_action in init|baseline|snapshot|kernel|hook|bind) ;; *) return 2;; esac
     umask 077
     run_dir=${NBD_MONITOR_RUN_DIR:-/run/nbd-monitor}/$dev
     [[ $run_dir == /* ]] || return 2
@@ -347,11 +502,7 @@ obs_worker() {
     systemctl_bin=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
     obs_context_ok=no obs_locked=no
     if [[ $obs_action == hook ]]; then
-        client_id=unknown; session=unknown; obs_id=unknown; data_host=unknown; data_port=unknown; data_export=unknown
-        if obs_read_context && [[ ${INVOCATION_ID:-unknown} != unknown && -n ${INVOCATION_ID:-} && ${obs_ctx[invocation]} == "$INVOCATION_ID" ]]; then
-            client_id=${obs_ctx[client]}; session=${obs_ctx[session]}; obs_id=${obs_ctx[id]}
-            data_host=${obs_ctx[host]}; data_port=${obs_ctx[port]}; data_export=${obs_ctx[export]}; obs_context_ok=yes
-        fi
+        obs_hook_context
     elif obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" ]]; then obs_context_ok=yes; fi
     if [[ $obs_context_ok == yes ]] && exec {obs_fd}> "$run_dir/observe.lock"; then
         if flock -n "$obs_fd"; then obs_locked=yes; fi
@@ -359,18 +510,15 @@ obs_worker() {
     if [[ $obs_context_ok == yes && $obs_locked != yes ]]; then
         obs_emit "$obs_phase" "$obs_stage" observation_lock_busy || :
     fi
+    if [[ $obs_action == bind ]]; then obs_bind_invocation || :; return 0; fi
     if [[ $obs_action == hook ]]; then obs_hook_native_result || :; fi
     if [[ $obs_action == baseline || $obs_action == snapshot || $obs_action == hook ]]; then obs_snapshot || :; fi
     obs_kernel || :
+    if [[ $obs_action == init ]]; then obs_preconnect || :; fi
     if [[ $obs_stage == disconnect-final ]]; then
-        local native=unknown native_id= line
-        if [[ $obs_context_ok == yes && -r $run_dir/observation.native ]]; then
-            while IFS= read -r line; do
-                case $line in id=*) native_id=${line#id=};; result=*) native=${line#result=};; esac
-            done < "$run_dir/observation.native"
-            [[ $native_id == "$obs_id" ]] || native=unknown
-        fi
-        obs_emit exit disconnect-final exit_evidence_summary "NATIVE_STOP_RESULT=$native" \
+        local native=unknown native_executed=unknown native_code=unknown native_status=unknown native_pid=unknown native_reason=handoff_unavailable native_invocation=unknown
+        obs_read_native_handoff || :
+        obs_emit exit disconnect-final exit_evidence_summary "NATIVE_STOP_RESULT=$native" "NATIVE_STOP_EXECUTED=$native_executed" "NATIVE_STOP_CODE=$native_code" "NATIVE_STOP_STATUS=$native_status" "NATIVE_STOP_PID=$native_pid" "NATIVE_FACT_REASON=$native_reason" "NATIVE_INVOCATION_ID=$native_invocation" \
             "DEVICE_STATUS=${obs_summary_device:-unknown}" "DEVICE_SIZE_SECTORS=${obs_summary_size:-unknown}" "CHECK_RC=${obs_summary_check_rc:-unknown}" \
             "TCP_MAPPING=unverified" "TCP_RESULT=${obs_summary_tcp:-unknown}" \
             "DISCONNECT_OBSERVED=${obs_summary_disc:-unknown}" "DISCONNECT_SEND_ERROR_OBSERVED=${obs_summary_senderr:-unknown}" \
@@ -731,6 +879,7 @@ if [[ ${1:-} == observe-stop ]]; then
     dev=$2; boot_id=unknown; IFS= read -r boot_id < /proc/sys/kernel/random/boot_id || :
     run_dir=${NBD_MONITOR_RUN_DIR:-/run/nbd-monitor}/$dev
     [[ $run_dir == /* ]] || exit 0
+    obs_hook_context
     obs_call 4.5s hook observe-stop exit || :
     exit 0
 fi
@@ -922,16 +1071,15 @@ if [[ $mode == run ]]; then
         printf 'session=%s\npid=%s\n' "$session" "$current_pid" > "$connection_file.tmp.$$"
         mv -f -- "$connection_file.tmp.$$" "$connection_file"
         [[ $current_pid != unknown ]] || log '无法读取可靠连接 PID；本轮禁止自动补做 detach'
-        obs_invocation=$(obs_native_invocation) || obs_invocation=unknown
+        # Bind only after registration, using independently checked evidence.
         obs_write_context || obs_emit startup run observation_runtime_write_failed "PATH=observation.state" || :
         obs_emit startup run session_created "DATA_HOST=$data_host" "DATA_PORT=$data_port" "EXPORT=$data_export" \
-            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1" || :
+            "NATIVE_INVOCATION_ID=$obs_invocation" "KERNEL_VERSION=$(uname -r)" "MONITOR_VERSION=v0.4.2-P1-R-A" || :
         : # baseline captured immediately after register
     fi
 
     if [[ $recovered == yes ]]; then
-        obs_invocation=$(obs_native_invocation) || obs_invocation=unknown
-        obs_write_context || :
+        # Never replace a recovered binding with unknown or another invocation.
         obs_emit startup run session_recovered "NATIVE_INVOCATION_ID=$obs_invocation" || :
     fi
     start=$SECONDS
@@ -960,6 +1108,7 @@ if [[ $mode == run ]]; then
     count=0
     detached=no
     if [[ $recovered == no ]]; then obs_call 2s baseline run startup || :; fi
+    obs_call 2.2s bind run startup || :
     obs_last_device=connected
     obs_last_heartbeat=none
     obs_last_channel=unknown
@@ -1040,6 +1189,12 @@ if [[ $mode == run ]]; then
         elif (( count % heartbeat_interval_sec == 0 )); then
             obs_phase=runtime; [[ $obs_exit_started != yes ]] || obs_phase=exit
             obs_call 1.5s kernel run "$obs_phase" || :
+        fi
+        # Retry only unknown bindings at low frequency, after ordinary business.
+        if [[ $obs_exit_started == no && $observed_device == connected ]] && (( count > 0 && count % 30 == 0 )); then
+            if obs_context_matches && [[ ${obs_ctx[id]} == "$obs_id" && ${obs_ctx[invocation]} == unknown ]]; then
+                obs_call 2.2s bind run runtime || :
+            fi
         fi
         sleep 1
         ((count+=1))
