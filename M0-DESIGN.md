@@ -1,73 +1,68 @@
-# M0-Design：双端最小退出证据契约（研究稿）
-日期：2026-11-26。依据 PROJECT-SCOPE.md 的路线 C 与 T01～T13。本文为研究设计候选，不是生产代码或新处置授权；先验证关键接线与采样，再冻结实现。审核生产基线 8f16a33，正向回归基线 1a19ae2。
+# M0-Design：A1 / A2 / A3 最小退出诊断
+日期：2026-11-26。路线 C，用户已确认三类核心异常；依据 PROJECT-SCOPE.md。替代此前广泛观察研究（ddeb155）。本文件锁定第一阶段范围，不是生产代码或主动处置授权。审核代码基线 8f16a33，正向回归基线 1a19ae2。
 
-## 1. 研究结论与边界
+## 1. 唯一目标
 
-NBD_CMD_DISC 没有协议应答。Linux 6.12 的 nbd_disconnect() 调用 send_disconnects() 后返回 0，发送失败可能仅出现在内核日志。nbd-client 3.26.1 的传统 ioctl 退出依次执行 NBD_DISCONNECT、NBD_CLEAR_SOCK。因此命令返回、本地容量/PID、内核错误、TCP 关闭、QEMU 退出、控制协商、下一轮接入都是独立事实。非 persistent QEMU 的退出还受已协商连接及内部状态制约；不能将进程返回 0 或监听 active 视作 DISC 收到或接入恢复证明。部署 QEMU 精确版本待实机核对；源码结论不替代实机验证。
+先判断 detach 有没有发生、是否在本地生效、是否在服务端完成。重点是客户端已经解除而服务端长期残留，阻断下一轮接入。**等待真实故障检验这个最小集合，缺什么，再加什么。**
 
-10911 事故证明：旧 QEMU 持有失去真实对端的 ESTAB，新的 TCP 在监听队列积压；人工解除旧连接后 QEMU 退出，积压又触发新实例。NIX 事故缺失客户端历史日志。不能断言两次事故的客户端 DISC 发送失败或 QEMU 死锁已经查明。
-
-## 2. 最小事件：按事实而不是按属性组织
-
-事件共享最小身份：端（client/server）、资源（dev 或 port/export）、本机 boot、同轮 observation/session 或 run、事件种类、发生时间（单调时间与墙钟）、结果/原因。身份未知不禁止独立事实记录。事件时间取观察时刻，区分原生开始/结束时间及 Journal 接收时间。两端单调时钟不直接比较。
-
-| 事件族 | 触发时机 | 最小有效载荷 |
+| 分类 | 必要事实 | 初始诊断 |
 |---|---|---|
-| C1 client_generation | 原生启动前、连接确认、register 结果；必要身份补齐 | 客户端/endpoint、boot、observation/session、native InvocationID、连接 PID/容量、启动/登记结果；preconnect 锚点及可取得的 TCP 候选身份 |
-| C2 client_detach | 可取得的退出前触发；原生 ExecStopPost；已有补做或归零判定 | phase=pre/post、执行事实、开始/结束、退出码/信号、local state 与 zero、PID、观察来源/缺口；原生内核日志按设备/代次/窗口关联 |
-| C3 client_close | 退出业务开始、请求写入/响应/状态变化、最终结束 | session、zero、实际传输阶段/结果、首次与最终尝试时间、次数、收到的回复、退出原因；未尝试/不确认/异常单独表达 |
-| S1 server_generation | export 建轮、register、可取得的首次接受连接 | run、boot、QEMU PID+starttime、session/登记结果；接受 socket 四元组、inode/cookie、身份置信；未登记也保留 run |
-| S2 server_exit | 首次 close、首次登记/心跳/closing 超时、状态变化、finish、既有处置结果 | old socket 存在/状态/未知、QEMU 活性及实际退出结果、最后匹配心跳时间、timeout/finish 原因、listener 状态/队列、已有处置结果 |
-| S3 server_close | 请求收到/匹配/拒绝、状态保存结果、生成回复、最终协商结果 | run/session、zero（客户端声明）、request/commit/reply 事实、complete/abnormal/wait/error、次数和时间 |
-| 双端下一轮 | 现有 previous、真实原生启动、export 建轮/登记；无需主动探测 | 上轮结果、旧 run 是否已释放、新 observation/session/run 及实际原生启动/登记结果 |
+| A1 退出动作缺失 | 本轮连接建立过，进入退出/关机，有直接证据表明 detach 未执行 | 记录动作事实和退出上下文，不采集额外设备信息 |
+| A2 本地退出未完成 | detach 已执行，本地仍连接或解除无法确认 | 记录命令实际结果、本地状态及异常时的 size/PID、原生 NBD 错误、既有补做结果 |
+| A3 服务端退出未完成（核心） | detach 已执行、本地已解除、服务端本轮退出仍未完成 | 通过 close、既有超时及 finish 取得旧 TCP、QEMU、协商状态和必要的入口证据 |
+| 正常对照 | detach 执行、本地解除、服务端退出，完成既有协商 | 少量结果记录，不作设备快照 |
 
-以上是语义族，非七套 worker，也不是所有字段在每次事件中必填。可合并事件。无状态变化不新增正常心跳历史；关键失败/恢复及初次、终态不丢失。正常重复 wait 或超时按同轮汇总，不能掩盖最终失败。M0 以原生日志和现有控制状态为优先来源。
+unknown 不等于 no；上述是故障维度，不要求所有异常互斥或强行归类。A2 的未解除与未知必须区分；A3 若只取得客户端 zero 声明而无本地直接日志，注明 reported。原生返回非零与本地实际解除也可并存。突然断电、手工绕过 systemd、日志缺失时 detach 事实可能未知，不能凭无日志断言 A1。
 
-## 3. 客户端关键窗口与原生接线
+## 2. 五类最小事实及采集点
 
-现有 monitor Before/PartOf=nbd@，原生 nbd@ Requires/After=monitor；因此关机时 native 先停止，monitor disconnect 随后。现有 ExecStopPost=observe-stop 可复用已验收 A.2 解析；查询本轮 InvocationID，匹配实际原生 ExecStop 路径/参数及 PID、start/stop、code/status。SERVICE_RESULT、EXIT_CODE、EXIT_STATUS 属于服务/主进程结果，不能直接当原生 ExecStop 返回值。ExecStopPost 也可能由启动失败触发。未执行、开始但未结束、结果未知不可混淆；不能仅凭没有日志断言未执行。
+| 编号 | 事实 | 客户端 | 服务端 |
+|---|---|---|---|
+| M01 | 本轮身份 | 连接建立时复用 A.2 必要身份、session/boot/native InvocationID 与连接 PID | export run、boot、QEMU PID/starttime、register 关联 |
+| M02 | detach 是否发生及结果 | 原生 ExecStopPost/systemd 日志：执行与否、开始/结束、退出码/信号或未知 | 不推断客户端原生命令 |
+| M03 | 本地是否解除 | 复用既有 device_status、退出钩子及归零/补做结果；异常时补必要 size/PID | zero=yes 是客户端报告 |
+| M04 | 双端确认 | 实际 close 尝试、有效回复或未确认、最终结果 | 实际收到/匹配请求、已有状态结果、生成回复与最终协商结果 |
+| M05 | 旧轮是否解除 | 复用实际 previous/下一次连接结果 | close 尚未完成、scan timeout、finish 等既有触发点的 QEMU、必要 TCP/队列证据、已有处置结果 |
 
-关键难点是 detach 前真实现场。ActiveState=deactivating 轮询不保证发生在 ExecStop 之前；ExecStop.start_time 是事后事实，不是事前状态。优先保留连接建立身份，再验证确实需要的前置采样：仅本轮身份、size/pid 三态、必要的已知 TCP 候选，不读块设备、不查挂载、不联网握手、不重新执行 detach。直接手工 detach、突发断电、启动未完成时该窗口可缺失。
+共享身份、时间与结果；原生事实独立于关联成功。合并记录，不要求五套 worker、独立文件或固定字段格式。正常心跳不逐次记录；不新增正常运行采样。不抢 detach 前快照，也不要求客户端建立 TCP 四元组才能退出。确需不可重建的 socket 锚点时，先证明诊断必要性，允许一次性有限取证，不预设扩展。
 
-候选接线 A（首选实验）：独立、弱依赖、有界的一次性观察单元，启动顺序 After=nbd@，停止与 nbd@ 共同发生时先观察；通过 PartOf 传播停止/重启并检验 Wants 拉起与失败隔离。不能把单独停止观察单元当作原生 detach 已执行，不保证非 systemd 路径；需验证 mount、网络和 shutdown 无环。候选 B：显式在原生 ExecStop 列表前插入观察命令，必须清空并重列厂商命令；systemd 257 的停止命令超时会跳过后续 ExecStop，单纯 '-' 不足以证明安全，故不作为首选。候选 C：不增加接线，仅保留建立时身份及原生事后记录，pre 标为 unknown。先用隔离实验评估 A 的实际诊断增益及成本，未经确认不改生产单元。即使有 timeout 也不能承诺不可中断内核等待必定结束。
+## 3. 客户端：A1 与 A2
 
-退出后复用原生 hook、既有 device_status/close 条件和结果；观察用 A.2 sysfs 三态，控制层检查保持原样。不为观察额外重复控制命令。内核关键消息优先直接从现有 Journal 取回，按本机 boot、设备名、代次和原生退出窗口限定；有重名/时钟/截断/日志缺失则 candidate/unknown。第一阶段先验证离线提取能否满足要求，不默认保留周期 kernel.cursor/recent 或重复 raw 日志。
+保留原有 systemd 停止顺序：native detach → ExecStopPost → monitor disconnect/close。复用 A.2 原生 ExecStop 执行事实解析，核验本轮 InvocationID、命令及 PID/时间/code/status；未绑定也记录独立原生事实。SERVICE_RESULT 等主进程/服务结果不冒充 ExecStop 结果；ExecStopPost 可能因启动失败触发。未执行、开始未结束、失败、成功、未知分别保留。
 
-## 4. 服务端独立观察：在旧实例还存在时取证
+取消前置观察单元、detach 前实时快照、前置握手、ActiveState 观察轮询以及 M0-E01。连接前身份锚点不等于 detach 前快照，保留必要 A.2 成果。观察不得改变原生命令、停止顺序、既有 device_status 和 detach 安全授权。
 
-nbd-export@.socket Accept=no；监听 fd 交给 qemu-nbd，现有 export 记录 run/PID/starttime 后 exec QEMU，实际接受 socket 稍后才建立；ExecStopPost=finish 在进程停止后执行，不能作为残留现场的唯一观察点。
+A2 先用实际退出码/信号/时间、本地归零检查、size/PID 和已有补做结果。内核 NBD disconnect / Send disconnect failed / shutting down sockets 等线索优先事后从原生 Journal 关联；记录缺口，不将未发现错误说成没有错误。Linux 6.12 的 send_disconnects() 错误可能不经 nbd_disconnect() 返回给用户空间；DISC 无协议应答。无需周期 kernel.cursor/recent、重复 raw、挂载/holders/inflight、存储拓扑和全量 I/O 统计。未来实际 A2 证据不足再申请扩展。
 
-S1 优先在成功 register 或随后已有 heartbeat/scan 的有限补齐窗口取得接受 socket，未登记 run 在首次 scan/登记超时时取证。若连接极短或采样失败，记录 unknown，不新增常态 TCP 轮询。S2 在首次有效 close（尤其 wait）、已有 scan 判定 timeout、旧轮占用阻止新 export、finish、已有 reset/入口恢复的实际结果处取证。复用现有 scan.timer（5s 配置，不等于固定 5s 实际周期）。已记录同轮同状态不反复采集；如需判断之后是否释放，复用已有状态变化/finish/下一轮触发，避免一次失联快照被当成永久状态。没有对应触发时不能承诺观察到每次 TCP 转换或实际新接入尝试。
+## 4. 服务端：A3 的最小独立观察
 
-观察不得在资源锁内执行耗时外部命令、改变原有 reply/finish/scan 时间预算或阻塞原生 exec。先捕获已校验 run/PID/boot 与控制结果，释放锁后有界查询并前后核验身份；发生代次变化时仅保留带时间的候选。优先复用既有 .state 字段；不改变 .state schema 或新增持久历史。
+优先复用两个异常入口：① 收到本轮有效 close/zero=yes，旧 QEMU 尚未退出；② 既有 heartbeat/registration/closing timeout。finish 保留实际进程退出事实；实际下一轮接入复用既有事件。第一次 wait 可是正常收尾时间差，超过既有期限仍未解除才确定持续异常。客户端突然消失时无需其最终报告；只能证明服务端观察到的失联及残留，不证明客户端死亡或 detach 是否执行。
 
-## 5. TCP 最小身份与判定
+| A3 子类 | 需要区分 |
+|---|---|
+| A3.1 | 同一旧 run 的已接受数据 TCP 仍存在、QEMU 仍运行 |
+| A3.2 | 旧 TCP 未见或已确认解除，但 QEMU 仍运行；查询未知不得当作已解除 |
+| A3.3 | QEMU 已退出，但控制协商未完成或下一轮实际接入失败 |
 
-服务器优先使用有界 ss 查询目标端口，核对非 LISTEN 连接的实际 QEMU 进程归属（PID+启动身份；必要时核对该 PID 的 socket fd/inode），记录本地/对端 IP:port、TCP state、可取得的 inode 或 sk cookie、scope/置信；监听记录只需是否存在及 Recv-Q。不要混淆监听队列连接数与已接受 socket 的数据字节队列；不采集 RTT/吞吐/拥塞/完整 TCP_INFO。
+重点先跑通 A3.1。服务端以已知 run/boot/PID+starttime 核验实际持有的非 LISTEN socket，异常窗口有限 ss 查询本地/对端地址端口、TCP 状态和可得 inode/cookie；必要时仅核对目标 QEMU 的 socket fd。监听 Recv-Q 仅在判断后续接入受阻时记录，区别监听与已接受连接。不常态采样，不转储完整 TCP_INFO，不跨主机比较 inode/cookie。register 不能独立证明 TCP 归属；多个候选、代次变化、查询失败等保留 candidate/unknown，不强配。先验证仅凭服务器 run/进程及异常时查询是否已足够；如实际不足再论证建立时 socket 身份锚点。TCP 状态不证明收到 DISC。
 
-客户端内核 socket 不一定显示用户空间进程归属；nbd PID 与 TCP PID 不应强等同。用实际四元组候选及服务器反向四元组、session/run、时间窗口交叉关联；同 endpoint 唯一候选也非内核直接证明。cookie/inode 只用于本机 boot/netns 内追踪，不跨主机比较；NAT、代理、多个候选、端口复用或查询失败降为 candidate/unknown。现有 register 以端口/current run 建立控制身份，并不验证该 TCP 是该客户端的真实数据连接，不得把 session 登记当 TCP 确证。M0 不增加线上协议、不追踪全机 socket、不采包或改 QEMU trace 配置。
+外部查询不在资源锁内进行，先保存必要控制上下文、释放锁、前后复核代次；不能阻塞原生退出、回复或 scan。记录首次异常与已观察到的终态，不把一次快照冒充永久状态；不承诺观察到所有中间 TCP 转换。后续连接是否成功只依据真实连接结果，不主动探测。
 
-仅在已关联的旧 socket 仍可见时肯定残留；成功查询未见目标只说明本观察窗口/范围内未见。已知 socket 消失、TIME-WAIT 等 TCP 收尾和 QEMU 退出分别记录，不能一律视为残留。旧 QEMU PID 不可读时区分已确认不在、PID 复用、权限/查询未知。独立日志可以定位阻塞环节，但不能由 ESTAB 或心跳超时单独判定客户端死亡或授权强制恢复。
+## 5. 双向确认
 
-## 6. 双向确认：复用现有 close，不新增协议
+沿用 previous/register/heartbeat/close。现有客户端仅在确认本地解除后发送 close(session, zero=yes)。服务端按现有状态生成 complete/abnormal/wait 等结果，客户端记录实际收到的结果或未确认。首次 wait 与最终超时不同；complete 不是文件系统一致性或下一轮接入保证；abnormal 不能被 monitor 退出码 0 掩盖。
 
-现有 close 在原生服务 inactive/failed 且本地 device_status 确认 disconnected 后才发送 zero=yes。服务端按 session/run、zero 声明、process=exited 及既有 fault/exit_kind 状态返回结果；客户端收到 complete 或 abnormal 均可能把本地 session 标记 closed。此控制语义保持不变。
+初始仅记录请求尝试、服务端实际收到、生成回复及客户端实际收到/无有效回复、最终结果；不预先扩展 wire 全阶段遥测或请求 ID。客户端写入不证明送达，服务端生成回复不证明客户端收到；现有协议不能逐次精确关联时保留未知。若真实故障无法区分控制连接、写入和读取环节，再按准入原则增补。
 
-当前 wire() 将打开连接失败、写入失败、读超时、无效响应合并为失败。M0 需要在实际 wire 阶段区分：未尝试/连接失败/请求本地写入失败/写入完成但未取得有效回复/收到有效回复/整体超时。写入完成不是网络送达。服务端分别记录有效请求收到、身份校验、状态保存成功/失败、生成或尝试写出回复；不能从服务端 printf 成功推断客户端收到。保持 stdout 原有 wire 结果，日志走原有 Journal 通道；不得因日志影响状态保存、锁和回复。现有协议没有逐次请求 ID，重试只能按 session/run、双方时间及次数关联；丢失位置无法判明则 unknown，不为每次重试新增协议字段。
+## 6. 验收、约束和停止条件
 
-## 7. 最小诊断输出与验收
+先验证正常对照、A1（未执行/未知）、A2（真实返回、本地未解除/未知）、A3（本地归零而服务端残留、服务端独立失联取证和双向确认）；同时回归并行设备身份、观察失败、短时失联、原生成功但内核错误、后续接入。T01～T13 是历史细分验收参考，不是新采集业务清单。难以安全复现的情况使用隔离模拟，不破坏在用设备。
 
-一次退出保留独立维度：native=success/failure/not_executed/started_no_result/unknown；local=connected/disconnected/unknown；server_socket=present/not_observed/unknown；server_process=alive/exited/unknown；close_client/close_server 各自结果；next_connection=success/failure/not_attempted/unknown；证据范围与缺口。值是语义候选，不是新控制状态机。
+保留既有控制业务及安全检查；默认 detach_enabled=no、reset_on_timeout=no。不新增持久化观察文件、独立历史、daemon、协议、设备监测或主动恢复权限。日志复用 Journal，必要临时文件仅限确认易失目录；不承诺失电时最后日志必然持久保存。观察成本及异常失败隔离以实测验证。先冻结 M0，投入真实运行；不预设第二、第三阶段功能。任何真实故障暴露的新缺口均按 PROJECT-SCOPE.md §3 重新准入。
 
-优先验证 T01 正常、T04 原生成功与内核错误并存、T06 本地归零与服务器残留、T09 请求/回复故障、T10 突发消失、T11 旧实例释放后接入仍受阻；再覆盖其余 T02～T13。隔离注入不能代替真实偶发故障捕获。正常路径、观察器失败/超时、并发代次及停止顺序均须回归。第一阶段完成后冻结证据集合，只有真实故障仍无法区分才提出扩展。无需在 M0 阶段强制证明 DISC 已收到或实现自动安全恢复。
+下一步只设计/实现最小 A1/A2/A3 记录及回归，不开展前置观察实验。服务端异常时 socket 归属、原生日志关联及实际执行成本尚需验证；具体事件格式与实现可随最小实验收敛，不能据此扩大范围。
 
-## 8. 轻量化与未决事项
-
-不采集挂载、Btrfs/LVM 等拓扑、常规 I/O 统计，不新增 daemon、周期全量采集、持久化文件、依赖、协议或主动处置权限。日志优先原生 Journal；评估直接 stderr 的单行 key=value 输出是否足够（避免每条 logger 外部命令），保留原生 systemd 元数据和显式身份。日志投递不等于持久化确认；突发失电可能损失尾部证据。必要临时状态只在确认易失的 /run 或 /tmp 中复用/有界保存；服务端 /run 尚需核验。默认 detach_enabled=no、reset_on_timeout=no 不变。所有预算通过实机测量冻结，不凭正常运行耗时推定冷启动或关机上限。
-
-未决：前置观察单元能否满足失败隔离；最小 socket 归属及关联在真实部署的可行性；wire 阶段记录如何做到不改变控制行为；离线 Journal 关联能否保留关键内核线索；部署 QEMU 精确版本及服务端日志保留策略。下一步先完成小型隔离实验与只读现场测量，再决定生产重建实现，不自动延伸第二、第三阶段。
-
-## 9. 研究依据
+## 7. 研究依据
 
 - [NBD 协议：Terminating transmission / NBD_CMD_DISC](https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md)
 - [Linux Debian 6.12.94 驱动 nbd.c](https://sources.debian.org/src/linux/6.12.94-1/drivers/block/nbd.c)（同 6.12 系列参考，不冒充实际运行内核的完整构建源码）
