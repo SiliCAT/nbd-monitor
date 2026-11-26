@@ -13,6 +13,7 @@
 - `etc/*.conf.in`：配置结构模板，尚无冻结的配置格式。
 - `etc/systemd/system/**/*.in`：非活动 systemd 模板，保留原生 nbd@ 集成、Type=notify、socket activation、数据与控制通道分离和扫描结构；未验收，不可直接部署。不得将模板直接改名安装。客户端 monitor 停止预算模板为 180s；其他历史参数不是新版已冻结值。
 - [Close Exchange 设计契约](docs/CLOSE-EXCHANGE-DESIGN.md)：E01–E12、E08 细则、W01–W09，设计版本 v0.1 与工程版本 v0.0.1 独立。字段候选和未决事项仍须审核。
+- [最小实机接入、功能边界及部署验收](docs/MINIMAL-DEPLOYMENT-DESIGN.md)：已审核的首个最小实机系统范围、MD01–MD15 及 D01–D14 验收条件。独立控制端口为 TCP 11120；首个版本不实现主动补做 detach、自动 Reset 或镜像维护。
 
 ## 研发边界
 

@@ -2,7 +2,7 @@
 # Field names and defaults are not frozen.
 [global]
 # client_id = ...
-# control_port = 10921
+# control_port = 11120
 
 # [nbd0]
 # control_host = ...
