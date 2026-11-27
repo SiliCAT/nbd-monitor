@@ -1,4 +1,4 @@
-# v0.0.1 — non-deployable development template; not yet validated.
+# v0.0.1 — experimental unit; not yet validated on target systems.
 [Unit]
 Description=Client-side NBD session monitor for %i (experimental)
 Wants=network-online.target

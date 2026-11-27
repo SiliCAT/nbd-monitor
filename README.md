@@ -15,6 +15,6 @@
 ## 仓库与验证
 
 - `client/`、`server/` 对应目标主机的根文件系统路径。两个脚本分别位于 `usr/local/libexec/nbd-monitor` 和 `usr/local/libexec/nbd-server`。
-- `etc/*.conf.in` 和 systemd 的 `*.in` 文件是实机验收模板。客户端从原生 `/etc/nbdtab` 读取设备、主机、数据端口和 export。首验使用独立 QCOW2 镜像、端口、设备和挂载点。真实 systemd 停止顺序、QEMU 与内核 NBD 联动仍需实机验证。
+- `etc/*.conf` 和 systemd 单元采用正式文件名，供审核后的隔离环境实机验收；部署前须按目标环境填写业务配置。客户端从原生 `/etc/nbdtab` 读取设备、主机、数据端口和 export。首验使用独立 QCOW2 镜像、端口、设备和挂载点。真实 systemd 停止顺序、QEMU 与内核 NBD 联动仍需实机验证。
 - [Close Exchange 契约](docs/CLOSE-EXCHANGE-DESIGN.md) 和 [最小实机部署设计](docs/MINIMAL-DEPLOYMENT-DESIGN.md) 保留完整设计背景。首版以本 README 的单一成功路径、120 秒服务端截止和 `/run` 状态规则为实施范围。
 - 旧版代码位于 [archive/v0.4.2-M0](https://github.com/SiliCAT/nbd-monitor/tree/archive/v0.4.2-M0)。本版本使用自己的线协议和本次开机的状态。

@@ -26,7 +26,7 @@
 - 以 Run 为分析实体，记录正常或失败判定，以及相应的退出事实和交接结果。
 - M0 作为历史技术资产，不作为新版行为兼容规范。可按需复用经过验证的事实采集实现；不恢复其独立观察框架。
 - 首个最小系统只承担原生连接、生命周期接入、退出事实交接与诊断，不实施主动故障恢复或镜像维护。
-- v0.0.1 已实现脚本流程，systemd 单元和配置仍以 `.in` 验收模板交付。
+- v0.0.1 已实现脚本流程，systemd 单元和配置采用正式文件名交付，仍待实机验收。
 
 ## 2. 首个实机可用版本的功能边界
 
@@ -96,7 +96,7 @@ nbd-scan.timer → nbd-scan.service → scan → 观察与超时结论
 
 ### 3.2 最小 systemd 单元与程序入口
 
-| 单元（基底中为 `.in` 模板） | 职责 |
+| 单元（正式文件名，待验收） | 职责 |
 |---|---|
 | `nbd-export@.socket` | 数据端口监听。 |
 | `nbd-export@.service` | 本轮身份建立、原生导出、原生退出事实取得。 |
@@ -121,7 +121,7 @@ nbd-scan.timer → nbd-scan.service → scan → 观察与超时结论
 
 使用 `/etc/nbdtab`、Debian 原生 `nbd@nbdN.service` 和 `/usr/sbin/nbd-client` 负责真实连接及 detach。上层挂载由现有 fstab、systemd automount 或 autofs 管理。本项目不增加挂载管理器，不代替原生 ExecStart/ExecStop，不修改文件系统数据。
 
-`nbd-monitor@.service` 和 `nbd@.service.d/monitor.conf.in` 负责接入原生单元。模板使用 `ExecStartPre=admit`、`ExecStartPost=observe-start` 和 `ExecStopPost=observe-stop`；依赖和实际调用顺序须在目标机验证。
+`nbd-monitor@.service` 和 `nbd@.service.d/monitor.conf` 负责接入原生单元。模板使用 `ExecStartPre=admit`、`ExecStartPost=observe-start` 和 `ExecStopPost=observe-stop`；依赖和实际调用顺序须在目标机验证。
 
 ### 4.2 启动时间轴
 
@@ -257,7 +257,7 @@ nbd0 192.0.2.10 TEST port=10920
 | P8 | 观察退出与 Run 档案 | 停止上层业务，卸载，再停止原生 nbd@ |
 | P9 | 确认旧资源释放及 Journal 中的退出记录 | 重新连接，验证数据及新轮关联 |
 
-按现有根文件系统映射目录进行最小人工部署，不开发安装器。只有相应实现与单元通过审核后，才将 `.in` 模板转为正式部署文件。不允许直接复制整个 v0.0.1 基底到生产根目录；特别禁止在活动挂载期间替换或重启 monitor、原生 nbd@ 或 export 服务。
+按现有根文件系统映射目录进行最小人工部署，不开发安装器。仓库直接提供正式文件名，无需转换后缀；相应实现与单元通过审核后，按目标环境填写配置并部署到隔离验收环境。不允许直接复制整个 v0.0.1 基底到生产根目录；特别禁止在活动挂载期间替换或重启 monitor、原生 nbd@ 或 export 服务。
 
 部署失败时停止在隔离环境中诊断，保留证据。未确认旧资源安全释放，不继续启动新导出、不覆盖镜像。历史生产版本可从 `archive/v0.4.2-M0` 获取；回退应在安全停机且确认无活动连接后进行，不能混用状态文件及协议。
 
