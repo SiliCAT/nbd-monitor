@@ -1,18 +1,399 @@
 #!/bin/bash
-# nbd-server v0.0.1 — development skeleton; no runtime business implemented.
 set -euo pipefail
+export LC_ALL=C
+umask 077
 
-case "${1:-}" in
-    --version)
-        printf '%s\n' 'nbd-server 0.0.1 (development skeleton)'
-        ;;
-    --help|-h)
-        printf '%s\n' 'nbd-server --version | --help' \
-            'Reserved entry points (not implemented): request | export PORT | finish PORT | scan' \
-            'Development skeleton. Do not deploy.'
-        ;;
+config=${NBD_SERVER_CONFIG:-/etc/nbd-server.conf}
+runtime=${NBD_SERVER_RUNTIME:-/run/nbd-server}
+qemu=${NBD_SERVER_QEMU:-/usr/bin/qemu-nbd}
+readonly admission_window=3000 heartbeat_window=3000 close_window=12000 replay_window=15000
+# These records are private to this boot and distinct from the M0 disk archive.
+readonly keys=(session client run pid start phase deadline native device client_fault qemu_result qemu_code qemu_status released result reason ended)
+declare -A images=() exports=() state=()
+
+log() { printf 'nbd-server port=%s %s\n' "${port:--}" "$*" >&2; }
+die() { log "$*"; exit 1; }
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 && $1 != 11120 )); }
+valid_id() { [[ $1 =~ ^[a-f0-9]{32}$ ]]; }
+valid_name() { [[ $1 =~ ^[a-zA-Z0-9_.-]{1,128}$ ]]; }
+valid_number() { [[ $1 =~ ^(0|[1-9][0-9]{0,12})$ ]]; }
+
+tick() {
+    local uptime
+    read -r uptime _ < /proc/uptime
+    now=$((10#${uptime%.*} * 100 + 10#${uptime#*.}))
+}
+
+load_config() {
+    local line section='' key value image identity
+    local -A file_ids=()
+    local assignment='^[[:blank:]]*([a-z]+)[[:blank:]]*=[[:blank:]]*(.*[^[:blank:]])[[:blank:]]*$'
+    [[ -r $config ]] || die "config_unreadable"
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line =~ ^[[:blank:]]*([#;].*)?$ ]]; then continue; fi
+        if [[ $line =~ ^\[([a-z0-9]+)\]$ ]]; then
+            section=${BASH_REMATCH[1]}
+            [[ $section == global ]] || valid_port "$section" || die "invalid_section"
+            continue
+        fi
+        [[ $line =~ $assignment && -n $section && $section != global ]] || die "invalid_config"
+        key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+        case $key in
+            image)
+                [[ $value == /* && ! ${images[$section]+set} ]] || die "invalid_image"
+                images[$section]=$value ;;
+            export)
+                valid_name "$value" || die "invalid_export"
+                [[ ! ${exports[$section]+set} ]] || die "duplicate_export"
+                exports[$section]=$value ;;
+            *) die "unknown_config_key=$key" ;;
+        esac
+    done < "$config"
+
+    (( ${#images[@]} && ${#images[@]} == ${#exports[@]} )) || die "incomplete_config"
+    for section in "${!images[@]}"; do
+        image=${images[$section]}
+        [[ ${exports[$section]+set} && -f $image ]] || die "invalid_resource=$section"
+        identity=$(stat -Lc '%d:%i' -- "$image") || die "image_stat_failed=$section"
+        [[ ! ${file_ids[$identity]+set} ]] || die "image_used_by_multiple_ports"
+        file_ids[$identity]=1
+    done
+}
+
+lock_resource() {
+    directory=$runtime/port-$port
+    mkdir -p -- "$directory"
+    exec {resource_fd}>"$directory/lock"
+    flock -w 1 "$resource_fd" || die "resource_lock_timeout"
+}
+
+unlock_resource() { exec {resource_fd}>&-; }
+
+save_file() {
+    local path=$1 temporary
+    shift
+    temporary=$(mktemp -- "$directory/.state.XXXXXXXX") || return 1
+    if ! printf '%s\n' "$@" > "$temporary" || ! mv -fT -- "$temporary" "$path"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+save_state() {
+    local key
+    local -a lines=()
+    for key in "${keys[@]}"; do lines+=("${state[$key]}"); done
+    save_file "$directory/${state[session]}.state" "${lines[@]}" || die "state_save_failed"
+}
+
+load_state() {
+    local id=$1 index
+    local -a lines=()
+    valid_id "$id" || die "invalid_saved_session"
+    mapfile -t lines < "$directory/$id.state" || die "state_unreadable"
+    (( ${#lines[@]} == ${#keys[@]} )) || die "invalid_state"
+    state=()
+    for index in "${!keys[@]}"; do state[${keys[$index]}]=${lines[$index]}; done
+    if [[ ${state[session]} != "$id" ]] || ! valid_number "${state[deadline]}" ||
+        ! valid_number "${state[ended]}"; then
+        die "invalid_state"
+    fi
+    case ${state[phase]} in
+        reserved|active|closing|ready|finished|blocked|released) ;;
+        *) die "invalid_phase" ;;
+    esac
+}
+
+load_current() {
+    current=
+    state=()
+    if [[ -e $directory/current ]]; then
+        read -r current < "$directory/current" || die "current_unreadable"
+        load_state "$current"
+    fi
+}
+
+journal_run() {
+    log "event=$1 session=${state[session]} client=${state[client]} run=${state[run]} result=${state[result]} reason=${state[reason]} native=${state[native]} device=${state[device]} client_fault=${state[client_fault]} qemu_result=${state[qemu_result]} qemu_code=${state[qemu_code]} qemu_status=${state[qemu_status]} released=${state[released]}"
+}
+
+fail_run() {
+    state[phase]=blocked state[result]=failed state[reason]=$1 state[ended]=$now
+    save_state
+    journal_run final
+}
+
+expire() {
+    [[ -n $current ]] || return 0
+    (( now >= state[deadline] )) || return 0
+    case ${state[phase]} in
+        reserved) fail_run admission_timeout ;;
+        active) fail_run heartbeat_timeout ;;
+        closing|ready) fail_run close_timeout ;;
+    esac
+}
+
+begin_closing() {
+    if [[ ${state[phase]} == active ]]; then
+        state[phase]=closing state[deadline]=$((now + close_window))
+    fi
+}
+
+read_process() {
+    local pid=$1 record
+    local -a fields=()
+    valid_number "$pid" && (( pid > 0 )) || return 1
+    IFS= read -r record < "/proc/$pid/stat" || return 1
+    read -r -a fields <<< "${record##*) }"
+    (( ${#fields[@]} > 19 )) || return 1
+    process_state=${fields[0]} process_start=${fields[19]}
+    valid_number "$process_start"
+}
+
+process_released() {
+    local pid=${state[pid]}
+    [[ $pid != - ]] || return 1
+    [[ -d /proc/$pid ]] || return 0
+    if read_process "$pid" 2>/dev/null; then
+        [[ $process_start != "${state[start]}" || $process_state == Z || $process_state == X ]]
+    else
+        [[ ! -d /proc/$pid ]]
+    fi
+}
+
+valid_native() { [[ $1 == success || $1 == failed || $1 == signaled || $1 == not_executed || $1 == unknown ]]; }
+valid_device() { [[ $1 == disconnected || $1 == connected || $1 == unknown ]]; }
+valid_fault() { [[ $1 == - || $1 == control_timeout || $1 == control_error ]]; }
+
+respond() { printf '1 %s %s %s %s\n' "$1" "$session" "${state[run]:--}" "${2:--}"; }
+
+request() {
+    local line version verb name client supplied_run native device fault
+    local -a parts=()
+    IFS= read -r -t 2 -n 513 line || { log "request_read_failed"; return 1; }
+    (( ${#line} <= 512 )) || return 1
+    read -r -a parts <<< "$line"
+    (( ${#parts[@]} >= 4 )) || return 1
+    version=${parts[0]} verb=${parts[1]} port=${parts[2]} session=${parts[3]}
+    [[ $version == 1 ]] && valid_port "$port" && valid_id "$session" || return 1
+    case $verb in
+        admit)
+            (( ${#parts[@]} == 6 )) || return 1
+            name=${parts[4]} client=${parts[5]}
+            valid_name "$name" && valid_name "$client" || return 1 ;;
+        heartbeat|status) (( ${#parts[@]} == 4 )) || return 1 ;;
+        close)
+            (( ${#parts[@]} == 7 )) || return 1
+            native=${parts[4]} device=${parts[5]} fault=${parts[6]}
+            valid_native "$native" && valid_device "$device" && valid_fault "$fault" || return 1 ;;
+        confirm)
+            (( ${#parts[@]} == 5 )) || return 1
+            supplied_run=${parts[4]}
+            valid_id "$supplied_run" || return 1 ;;
+        *) return 1 ;;
+    esac
+    [[ ${images[$port]+set} ]] || { respond rejected unknown_resource; return; }
+    lock_resource
+    load_current
+    tick
+    expire
+    if [[ $verb == status ]]; then
+        if [[ -z $current || ${state[phase]} == finished || ${state[phase]} == released ]]; then
+            respond available
+        else
+            respond unavailable "${state[phase]}"
+        fi
+        return
+    fi
+    if [[ $verb == admit ]]; then
+        [[ $name == "${exports[$port]}" ]] || { respond rejected export_mismatch; return; }
+        if [[ $session == "$current" && ${state[phase]} == reserved && ${state[client]} == "$client" ]]; then
+            respond admitted
+        elif [[ -e $directory/$session.state ]]; then
+            respond rejected session_used
+        elif [[ -n $current && ${state[phase]} != finished && ${state[phase]} != released ]]; then
+            respond rejected "${state[phase]}"
+        else
+            state=([session]=$session [client]=$client [run]=- [pid]=- [start]=- [phase]=reserved
+                [deadline]=$((now + admission_window)) [native]=- [device]=- [client_fault]=-
+                [qemu_result]=- [qemu_code]=- [qemu_status]=- [released]=no
+                [result]=pending [reason]=- [ended]=0)
+            save_state
+            save_file "$directory/current" "$session" || die "current_save_failed"
+            respond admitted
+        fi
+        return
+    fi
+
+    if [[ $session != "$current" ]]; then
+        if [[ $verb == confirm && -f $directory/$session.state ]]; then
+            load_state "$session"
+            if [[ ${state[phase]} == finished && ${state[run]} == "$supplied_run" && ${state[result]} == normal ]]; then
+                respond complete
+                return
+            fi
+        fi
+        respond rejected invalid_session
+        return
+    fi
+    case $verb in
+        heartbeat)
+            case ${state[phase]} in
+                active)
+                    state[deadline]=$((now + heartbeat_window))
+                    save_state
+                    respond active ;;
+                closing|ready) respond closing ;;
+                blocked) respond failed "${state[reason]}" ;;
+                *) respond rejected "${state[phase]}" ;;
+            esac ;;
+        close)
+            case ${state[phase]} in
+                reserved)
+                    state[native]=$native state[device]=$device state[client_fault]=$fault
+                    fail_run export_not_started
+                    respond failed "${state[reason]}"
+                    return ;;
+                finished|released) respond rejected "${state[phase]}"; return ;;
+            esac
+            if [[ ${state[native]} == - ]]; then
+                state[native]=$native state[device]=$device state[client_fault]=$fault
+                save_state
+                if [[ ${state[phase]} == blocked ]]; then journal_run late_client_facts; fi
+            elif [[ ${state[native]} != "$native" || ${state[device]} != "$device" ||
+                ${state[client_fault]} != "$fault" ]]; then
+                respond rejected conflicting_close
+                return
+            fi
+            if [[ ${state[phase]} == blocked ]]; then
+                respond failed "${state[reason]}"
+            elif [[ $fault != - || $native != success || $device != disconnected ]]; then
+                fail_run client_exit_unconfirmed
+                respond failed "${state[reason]}"
+            else
+                begin_closing
+                if [[ ${state[released]} == yes ]]; then
+                    state[phase]=ready
+                    save_state
+                    respond ready
+                else
+                    save_state
+                    respond waiting
+                fi
+            fi ;;
+        confirm)
+            if [[ $supplied_run != "${state[run]}" ]]; then
+                respond rejected invalid_run
+            elif [[ ${state[phase]} == ready ]]; then
+                # A matching ready reply is the one final server fact version.
+                state[phase]=finished state[result]=normal state[reason]=- state[ended]=$now
+                save_state
+                journal_run final
+                respond complete
+            elif [[ ${state[phase]} == finished && ${state[result]} == normal ]]; then
+                respond complete
+            elif [[ ${state[phase]} == blocked ]]; then
+                respond failed "${state[reason]}"
+            else
+                respond rejected "${state[phase]}"
+            fi ;;
+    esac
+}
+
+export_run() {
+    valid_id "${INVOCATION_ID:-}" || die "missing_invocation"
+    [[ ${LISTEN_PID:-} == "$$" && ${LISTEN_FDS:-} == 1 ]] || die "missing_activation_socket"
+    lock_resource
+    load_current
+    tick
+    expire
+    [[ -n $current && ${state[phase]} == reserved ]] || die "export_without_current_admission"
+    read_process "$$" || die "process_identity_unavailable"
+    state[run]=$INVOCATION_ID state[pid]=$$ state[start]=$process_start
+    state[phase]=active state[deadline]=$((now + heartbeat_window))
+    save_state
+    journal_run export_start
+    unlock_resource
+    exec "$qemu" --format=qcow2 --shared=1 "--export-name=${exports[$port]}" -- "${images[$port]}"
+}
+
+finish_run() {
+    local result=${SERVICE_RESULT:-unknown} code=${EXIT_CODE:-unknown} status=${EXIT_STATUS:-unknown}
+    valid_id "${INVOCATION_ID:-}" || die "missing_invocation"
+    lock_resource
+    load_current
+    [[ -n $current && ${state[run]} == "$INVOCATION_ID" && ${state[qemu_result]} == - ]] || return 0
+    tick
+    expire
+    state[qemu_result]=$result state[qemu_code]=$code state[qemu_status]=$status
+    if process_released; then state[released]=yes; fi
+    if [[ ${state[phase]} == blocked ]]; then
+        save_state
+        journal_run late_qemu_facts
+    elif [[ $result == success && $code == exited && $status == 0 && ${state[released]} == yes ]]; then
+        begin_closing
+        save_state
+        journal_run qemu_finished
+    else
+        fail_run server_exit_unconfirmed
+    fi
+}
+
+release_run() {
+    local id=$1
+    valid_id "$id" || die "invalid_session"
+    lock_resource
+    load_current
+    [[ $current == "$id" && ${state[phase]} == blocked ]] || die "not_current_blocked_session"
+    # The operator must verify the image and any queued data connections.
+    if [[ ${state[pid]} != - ]]; then process_released || die "export_still_present"; fi
+    tick
+    state[phase]=released state[ended]=$now
+    save_state
+    journal_run "manual_release uid=$EUID"
+}
+
+scan() {
+    local path id
+    for port in "${!images[@]}"; do
+        (
+            lock_resource
+            load_current
+            tick
+            expire
+            for path in "$directory/"*.state; do
+                [[ -f $path ]] || continue
+                id=${path##*/} id=${id%.state}
+                [[ $id != "$current" ]] || continue
+                load_state "$id"
+                if (( state[ended] > 0 && now - state[ended] >= replay_window )); then
+                    rm -f -- "$path"
+                fi
+            done
+        )
+    done
+}
+
+usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
+
+case ${1:-} in
+    --version) printf '%s\n' 'nbd-server 0.0.1'; exit ;;
+    --help|-h) usage; exit ;;
+    request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
+    export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;
+    unlock) (( $# == 3 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;
+    *) usage >&2; exit 1 ;;
+esac
+load_config
+case $1 in
+    request) request ;;
+    scan) scan ;;
     *)
-        printf '%s\n' 'nbd-server: v0.0.1 development skeleton; operation not implemented. Do not deploy.' >&2
-        exit 1
-        ;;
+        port=$2
+        [[ ${images[$port]+set} ]] || die "unknown_resource"
+        case $1 in
+            export) export_run ;;
+            finish) finish_run ;;
+            unlock) release_run "$3" ;;
+        esac ;;
 esac

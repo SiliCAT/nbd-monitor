@@ -21,5 +21,3 @@ KillMode=control-group
 RuntimeDirectory=nbd-server
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
-StateDirectory=nbd-server
-StateDirectoryMode=0700

@@ -1,7 +1,4 @@
-# v0.0.1 — structure only; not a deployable configuration.
-# Field names and defaults are not frozen.
-[global]
-
-# [10920]
-# image = /srv/images.nbd/example.qcow2
-# export = example
+# Select an existing, dedicated QCOW2 image before use.
+[10920]
+image = /srv/nbd/test.qcow2
+export = TEST

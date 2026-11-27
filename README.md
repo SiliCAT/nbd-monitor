@@ -1,27 +1,20 @@
 # nbd-monitor
 
-**v0.0.1 — 第二代研发基底（不可部署）**
+**v0.0.1 — 首版观察脚本，待实机验收**
 
-本仓库基于 Bash、systemd、Debian nbd-client 与 qemu-nbd，面向逐轮退出结果交叉分析。以 Run 为基本业务实体，服务端收集双端退出事实；close 是退出阶段的特殊心跳，不是成功退出证明。
+使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。其余记录为失败，保留原因和已有证据供人工分析。
 
-本次重建仅保留工程结构与设计契约，未实现连接、监护、退出、保护、维护、指标导出或任何旧版协议。不得复制到运行中的系统，不得安装、启用、重启现有 NBD 服务或替换现有 libexec 文件。
+## 启动与退出
 
-## 结构
+- 多个受管客户端可竞争同一资源。服务端在资源锁内确认第一个有效准入，原生 `nbd@` 的启动前置检查收到确认后才调用 nbd-client。一次准入只执行一次原生连接。
+- 数据 socket 保留 `Accept=no`。服务端执行导出前复核有效准入，连接身份依靠客户端守约。应限制两个端口的网络可达范围，仅允许受管客户端访问。用 `nbd-monitor report DEVICE` 通过控制通道查询状态。控制通道 TCP 11120 未认证、未加密。
+- 上层先安全卸载，原生 `nbd@` 执行 detach，再由 monitor 交换退出事实。服务端从首次有效 close 或 QEMU finish 取较早者开始计时，120 秒内完成判定；客户端停止阶段的通信上限为 150 秒。结构性证据缺失、异常和超时均按失败处理。
+- 旧轮未收口或发生失败时拒绝新一轮。人工核实旧 QEMU、镜像和数据连接均已释放后，可在服务端执行 `nbd-server unlock PORT SESSION`。Session 可从 Journal 中确认，解锁记录与原始失败结果一并保留。
+- 客户端与服务端的运行状态在 `/run`。整机重启使旧准入和 Session 失效，重新按当前资源状态准入。日志进入 Journal，历史是否跨重启保留取决于系统的 Journal 配置。
 
-- `client/`、`server/`：各自对应目标 Linux 根文件系统的工程路径。
-- `usr/local/libexec/nbd-monitor`、`usr/local/libexec/nbd-server`：最小入口骨架。仅帮助和版本查询可成功；所有业务操作明确返回未实现错误，不执行外部命令、不读写状态、不发起连接。
-- `etc/*.conf.in`：配置结构模板，尚无冻结的配置格式。
-- `etc/systemd/system/**/*.in`：非活动 systemd 模板，保留原生 nbd@ 集成、Type=notify、socket activation、数据与控制通道分离和扫描结构；未验收，不可直接部署。不得将模板直接改名安装。客户端 monitor 停止预算模板为 180s；其他历史参数不是新版已冻结值。
-- [Close Exchange 设计契约](docs/CLOSE-EXCHANGE-DESIGN.md)：E01–E12、E08 细则、W01–W09，设计版本 v0.1 与工程版本 v0.0.1 独立。字段候选和未决事项仍须审核。
-- [最小实机接入、功能边界及部署验收](docs/MINIMAL-DEPLOYMENT-DESIGN.md)：已审核的首个最小实机系统范围、MD01–MD15 及 D01–D14 验收条件。独立控制端口为 TCP 11120；首个版本不实现主动补做 detach、自动 Reset 或镜像维护。
+## 仓库与验证
 
-## 研发边界
-
-- 不要求兼容 v0.4 / M0 行为或线协议；从历史代码按需复用已验证的实现。
-- 继承 A1/A2/A3 诊断目标、安全不变量与原生 NBD 的职责。诊断事实不是 detach、Reset、镜像维护的新增授权。默认不自动处置；unknown 不等于成功、失败或安全释放。
-- 服务端阶段性退出观察 120s，客户端主动通信硬截止 150s，E08 满足即结束；外部 systemd 超时按 30s 梯度留余量。尚未实现计时或状态机。
-- Journal 为详细诊断日志；临时状态使用 /run（或 /tmp）。不新增持久化文件、字段、数据库或真实文件系统写入，除非先讨论并批准；现有 Run 档案的扩充亦须批准。
-- 不增加常驻组件或生产依赖。云端能完成的测试尽量在云端消化，真实 systemd、NBD、QEMU 和文件系统联动须实机验收。云端自动化、CI 不是本基底的正式工作项目。
-- 旧版不变地保存在 [archive/v0.4.2-M0](https://github.com/SiliCAT/nbd-monitor/tree/archive/v0.4.2-M0)，提交 `174a5b101c92ab95202cf0007dd83a205cc0589a`。Git 历史未重写。旧版设计与手册不再作为新版活动契约。
-
-本基底不是 Release，不是旧版的升级包；没有安装器、自动发布流程或生产可用性承诺。
+- `client/`、`server/` 对应目标主机的根文件系统路径。两个脚本分别位于 `usr/local/libexec/nbd-monitor` 和 `usr/local/libexec/nbd-server`。
+- `etc/*.conf.in` 和 systemd 的 `*.in` 文件是实机验收模板。客户端从原生 `/etc/nbdtab` 读取设备、主机、数据端口和 export。首验使用独立 QCOW2 镜像、端口、设备和挂载点。真实 systemd 停止顺序、QEMU 与内核 NBD 联动仍需实机验证。
+- [Close Exchange 契约](docs/CLOSE-EXCHANGE-DESIGN.md) 和 [最小实机部署设计](docs/MINIMAL-DEPLOYMENT-DESIGN.md) 保留完整设计背景。首版以本 README 的单一成功路径、120 秒服务端截止和 `/run` 状态规则为实施范围。
+- 旧版代码位于 [archive/v0.4.2-M0](https://github.com/SiliCAT/nbd-monitor/tree/archive/v0.4.2-M0)。本版本使用自己的线协议和本次开机的状态。

@@ -1,3 +1,8 @@
 [Unit]
 Requires=nbd-monitor@%i.service
 After=nbd-monitor@%i.service
+
+[Service]
+ExecStartPre=/usr/local/libexec/nbd-monitor admit %i
+ExecStartPost=-/usr/local/libexec/nbd-monitor observe-start %i
+ExecStopPost=-/usr/local/libexec/nbd-monitor observe-stop %i

@@ -1,18 +1,348 @@
 #!/bin/bash
-# nbd-monitor v0.0.1 — development skeleton; no runtime business implemented.
 set -euo pipefail
+export LC_ALL=C
+umask 077
 
-case "${1:-}" in
-    --version)
-        printf '%s\n' 'nbd-monitor 0.0.1 (development skeleton)'
-        ;;
-    --help|-h)
-        printf '%s\n' 'nbd-monitor --version | --help' \
-            'Reserved entry points (not implemented): run DEVICE | disconnect DEVICE | report DEVICE' \
-            'Development skeleton. Do not deploy.'
-        ;;
-    *)
-        printf '%s\n' 'nbd-monitor: v0.0.1 development skeleton; operation not implemented. Do not deploy.' >&2
-        exit 1
-        ;;
+config=${NBD_MONITOR_CONFIG:-/etc/nbd-monitor.conf}
+nbdtab=${NBD_MONITOR_NBDTAB:-/etc/nbdtab}
+runtime=${NBD_MONITOR_RUNTIME:-/run/nbd-monitor}
+sysfs=${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}
+systemctl=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
+notify=${NBD_MONITOR_NOTIFY:-/usr/bin/systemd-notify}
+readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000
+
+log() { printf 'nbd-monitor device=%s session=%s %s\n' "${device:--}" "${session:--}" "$*" >&2; }
+die() { log "$*"; exit 1; }
+valid_id() { [[ $1 =~ ^[a-f0-9]{32}$ ]]; }
+valid_port() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 && $1 != 11120 )); }
+
+tick() {
+    local uptime
+    read -r uptime _ < /proc/uptime
+    now=$((10#${uptime%.*} * 100 + 10#${uptime#*.}))
+}
+
+check_config() {
+    local line section='' control_port=''
+    client_id=
+    local assignment='^[[:blank:]]*([a-z_]+)[[:blank:]]*=[[:blank:]]*([a-zA-Z0-9_.-]+)[[:blank:]]*$'
+    [[ -r $config ]] || die "config_unreadable"
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line =~ ^[[:blank:]]*([#;].*)?$ ]]; then continue; fi
+        if [[ $line == '[global]' ]]; then section=global; continue; fi
+        [[ $section == global && $line =~ $assignment ]] || die "invalid_config"
+        case ${BASH_REMATCH[1]} in
+            client_id)
+                [[ -z $client_id ]] || die "duplicate_client_id"
+                client_id=${BASH_REMATCH[2]} ;;
+            control_port)
+                [[ -z $control_port && ${BASH_REMATCH[2]} == 11120 ]] || die "invalid_control_port"
+                control_port=11120 ;;
+            *) die "unknown_config_key" ;;
+        esac
+    done < "$config"
+    [[ $client_id =~ ^[a-zA-Z0-9_.-]{1,128}$ ]] || die "invalid_client_id"
+}
+
+load_nbdtab() {
+    local line option count=0 port_seen=no
+    local -a fields=() options=()
+    [[ -r $nbdtab ]] || die "nbdtab_unreadable"
+    port=10809
+    while IFS= read -r line || [[ -n $line ]]; do
+        read -r -a fields <<< "${line%%\#*}"
+        [[ ${fields[0]:-} == "$device" ]] || continue
+        (( count += 1 ))
+        (( ${#fields[@]} == 3 || ${#fields[@]} == 4 )) || die "invalid_nbdtab"
+        host=${fields[1]} export_name=${fields[2]}
+        IFS=, read -r -a options <<< "${fields[3]:-}"
+        for option in "${options[@]}"; do
+            case $option in
+                port=*)
+                    [[ $port_seen == no ]] || die "duplicate_data_port"
+                    port_seen=yes port=${option#port=} ;;
+                timeout=*|bs=*|no_optgo) ;;
+                *) die "unsupported_nbdtab_option=$option" ;;
+            esac
+        done
+    done < "$nbdtab"
+    (( count == 1 )) || die "invalid_nbdtab_device_count"
+    [[ $host =~ ^[a-zA-Z0-9_.-]{1,253}$ && $export_name =~ ^[a-zA-Z0-9_.-]{1,128}$ ]] ||
+        die "invalid_nbd_endpoint"
+    valid_port "$port" || die "invalid_data_port"
+}
+
+save_local() {
+    local file=$1 temporary
+    shift
+    temporary=$(mktemp -- "$directory/.state.XXXXXXXX") || return 1
+    if ! printf '%s\n' "$@" > "$temporary" || ! mv -fT -- "$temporary" "$directory/$file"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+load_context() {
+    local -a lines=()
+    [[ -r $directory/context ]] || return 1
+    mapfile -t lines < "$directory/context"
+    (( ${#lines[@]} == 6 )) || return 1
+    owner=${lines[0]} native_id=${lines[1]} session=${lines[2]}
+    host=${lines[3]} port=${lines[4]} admission=${lines[5]}
+    valid_id "$owner" && valid_id "$native_id" && valid_id "$session" &&
+        [[ $host =~ ^[a-zA-Z0-9_.-]{1,253}$ ]] && valid_port "$port"
+}
+
+marker() {
+    local id
+    [[ -r $directory/$1 ]] && read -r id < "$directory/$1" && [[ $id == "$native_id" ]]
+}
+
+sample_device() {
+    local path=$sysfs/$device
+    [[ -d $path ]] && IFS= read -r size 2>/dev/null < "$path/size" &&
+        [[ $size =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    pid=-
+    if [[ -e $path/pid || -L $path/pid ]]; then
+        IFS= read -r pid 2>/dev/null < "$path/pid" && [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    fi
+    [[ -d $path && -r $path/size ]]
+}
+
+device_status() {
+    local size pid first_size first_pid
+    observed_device=unknown
+    sample_device || return 0
+    first_size=$size first_pid=$pid
+    sample_device || return 0
+    [[ $size == "$first_size" && $pid == "$first_pid" ]] || return 0
+    if [[ $size == 0 && $pid == - ]]; then
+        observed_device=disconnected
+    elif [[ $size != 0 && $pid != - ]]; then
+        observed_device=connected
+    fi
+}
+
+native_stop_status() {
+    local snapshot line stop='' invocation=''
+    local record='^\{ path=/usr/sbin/nbd-client ; argv\[\]=/usr/sbin/nbd-client -d /dev/'"$device"' ; ignore_errors=(yes|no) ; start_time=\[([^]]+)\] ; stop_time=\[([^]]+)\] ; pid=([0-9]+) ; code=([^ ;]+) ; status=([^ ;]+) \}$'
+    local timestamp='^[A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [^[:cntrl:]]+)?$'
+    native=unknown native_code=- native_status=-
+    snapshot=$(timeout 1 "$systemctl" show -p InvocationID -p ExecStop "nbd@$device.service") || return 0
+    while IFS= read -r line; do
+        case $line in
+            InvocationID=*) invocation=${line#*=} ;;
+            ExecStop=*) stop=${line#*=} ;;
+        esac
+    done <<< "$snapshot"
+    [[ $invocation == "$native_id" && $stop =~ $record ]] || return 0
+    local started=${BASH_REMATCH[2]} stopped=${BASH_REMATCH[3]} stop_pid=${BASH_REMATCH[4]}
+    native_code=${BASH_REMATCH[5]} native_status=${BASH_REMATCH[6]}
+    if [[ $started == n/a && $stopped == n/a && $stop_pid == 0 && $native_code == '(null)' &&
+          ( $native_status == 0 || $native_status == 0/0 ) ]]; then
+        native=not_executed
+    elif [[ $started =~ $timestamp && $stopped =~ $timestamp && $stop_pid =~ ^[1-9][0-9]*$ &&
+            $native_status =~ ^(0|[1-9][0-9]*)(/[a-zA-Z0-9_+-]+)?$ ]]; then
+        case $native_code in
+            exited) if [[ ${native_status%%/*} == 0 ]]; then native=success; else native=failed; fi ;;
+            killed|dumped) if [[ ${native_status%%/*} != 0 ]]; then native=signaled; fi ;;
+        esac
+    fi
+}
+
+control() {
+    local budget=$1 verb=$2 line status
+    shift 2
+    local -a response=()
+    local duration
+    printf -v duration '%d.%02ds' "$((budget / 100))" "$((budget % 100))"
+    control_fault=control_error
+    reply_reason=-
+    # The timed child expands its own arguments and owns the TCP socket.
+    # shellcheck disable=SC2016
+    if line=$(timeout "$duration" bash -c '
+        exec 3<>"/dev/tcp/$1/11120" || exit 1
+        shift
+        printf "%s\n" "$*" >&3 || exit 1
+        IFS= read -r -n 513 reply <&3 && (( ${#reply} <= 512 )) || exit 1
+        printf "%s" "$reply"
+    ' bash "$host" 1 "$verb" "$port" "$session" "$@"); then
+        read -r -a response <<< "$line"
+        (( ${#response[@]} == 5 )) && [[ ${response[0]} == 1 && ${response[2]} == "$session" &&
+            ${response[4]} =~ ^[a-z_-]+$ ]] || return 1
+        reply=${response[1]} reply_run=${response[3]} reply_reason=${response[4]}
+        [[ $reply_run == - ]] || valid_id "$reply_run"
+    else
+        status=$?
+        if (( status == 124 || status == 137 )); then control_fault=control_timeout; fi
+        return 1
+    fi
+}
+
+new_session() {
+    read -r session < /proc/sys/kernel/random/uuid
+    session=${session//-/}
+    valid_id "$session" || die "session_unavailable"
+}
+
+admit() {
+    local owner
+    read -r owner < "$directory/monitor" || die "monitor_not_ready"
+    valid_id "$owner" || die "invalid_monitor_invocation"
+    check_config
+    load_nbdtab
+    device_status
+    [[ $observed_device == disconnected ]] || die "device_not_confirmed_free"
+    if (load_context && [[ $native_id == "$INVOCATION_ID" ]]); then die "invocation_already_attempted"; fi
+    new_session
+    save_local context "$owner" "$INVOCATION_ID" "$session" "$host" "$port" pending
+    control "$request_window" admit "$export_name" "$client_id" || die "admission_$control_fault"
+    [[ $reply == admitted && $reply_run == - ]] || die "admission_denied=$reply_reason"
+    save_local context "$owner" "$INVOCATION_ID" "$session" "$host" "$port" admitted
+    log "event=admitted client=$client_id native_invocation=$INVOCATION_ID port=$port"
+}
+
+observe_start() {
+    load_context && [[ $native_id == "$INVOCATION_ID" && $admission == admitted ]] || return 0
+    save_local online "$native_id"
+}
+
+observe_stop() {
+    load_context && [[ $native_id == "$INVOCATION_ID" ]] || return 0
+    save_local stopping "$native_id"
+    native_stop_status
+    device_status
+    save_local stopped "$native_id" "$native" "$observed_device"
+    log "event=native_stop native_invocation=$native_id native=$native code=$native_code status=$native_status device=$observed_device"
+}
+
+run() {
+    local next_heartbeat=0 last_native='' fault run_id=''
+    save_local monitor "$INVOCATION_ID"
+    "$notify" --ready
+    while :; do
+        if load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] &&
+            marker online && ! marker stopping && ! marker closing && ! marker fault; then
+            if [[ $last_native != "$native_id" ]]; then
+                next_heartbeat=0 last_native=$native_id run_id=
+            fi
+            tick
+            if (( now >= next_heartbeat )); then
+                fault=-
+                if ! control "$request_window" heartbeat; then
+                    fault=$control_fault
+                elif [[ $reply == failed || $reply == rejected || ( $reply != active && $reply != closing ) ]] ||
+                    ! valid_id "$reply_run" || [[ -n $run_id && $run_id != "$reply_run" ]]; then
+                    fault=control_error
+                else
+                    run_id=$reply_run
+                    save_local binding "$native_id" "$run_id"
+                fi
+                if [[ $fault != - ]]; then
+                    save_local fault "$native_id" "$fault"
+                    log "event=heartbeat_failed reason=$fault server_reason=${reply_reason:--}"
+                fi
+                next_heartbeat=$((now + heartbeat_interval))
+            fi
+        fi
+        sleep 1
+    done
+}
+
+disconnect() {
+    local deadline native=unknown observed_device=unknown fault=- expected_run='' reason
+    local -a facts=() saved=()
+    exec {close_fd}>"$directory/close.lock"
+    flock -w 1 "$close_fd" || die "disconnect_lock_timeout"
+    load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] || return 0
+    ! marker closing || return 0
+    tick
+    deadline=$((now + close_window))
+    save_local closing "$native_id"
+    if [[ -r $directory/stopped ]] && mapfile -t facts < "$directory/stopped" &&
+        [[ ${facts[0]:-} == "$native_id" ]]; then
+        native=${facts[1]:-unknown} observed_device=${facts[2]:-unknown}
+    else
+        device_status
+    fi
+    if [[ -r $directory/fault ]] && mapfile -t saved < "$directory/fault" &&
+        [[ ${saved[0]:-} == "$native_id" ]]; then
+        fault=${saved[1]:-control_error}
+    fi
+    if [[ -r $directory/binding ]] && mapfile -t saved < "$directory/binding" &&
+        [[ ${saved[0]:-} == "$native_id" ]]; then
+        expected_run=${saved[1]:-}
+    fi
+
+    local verb=close buffer=50
+    local -a payload=("$native" "$observed_device" "$fault")
+    reason=close_timeout
+    while :; do
+        tick
+        (( deadline - now > request_window + buffer )) || break
+        if ! control "$request_window" "$verb" "${payload[@]}"; then
+            reason=$control_fault
+            break
+        fi
+        tick
+        (( now < deadline )) || break
+        if [[ $reply == failed || $reply == rejected ]]; then
+            reason=$reply_reason
+            break
+        fi
+        if ! valid_id "$reply_run" || [[ -n $expected_run && $expected_run != "$reply_run" ]]; then
+            reason=run_mismatch
+            break
+        fi
+        expected_run=$reply_run
+        case $verb:$reply in
+            close:waiting)
+                (( deadline - now > close_interval + request_window + buffer )) || break
+                sleep 5 ;;
+            close:ready)
+                verb=confirm
+                payload=("$expected_run") ;;
+            confirm:complete)
+                log "event=exit result=normal run=$expected_run native=$native device=$observed_device"
+                return 0 ;;
+            *) reason=unexpected_reply; break ;;
+        esac
+    done
+    log "event=exit result=failed reason=$reason run=${expected_run:--} native=$native device=$observed_device"
+    return 1
+}
+
+report() {
+    check_config
+    load_nbdtab
+    new_session
+    control "$request_window" status || die "$control_fault"
+    case $reply in
+        available|unavailable)
+            printf 'port=%s status=%s reason=%s\n' "$port" "$reply" "$reply_reason" ;;
+        *) die "status_rejected=$reply_reason" ;;
+    esac
+}
+
+usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|observe-stop|disconnect|report DEVICE'; }
+
+case ${1:-} in
+    --version) printf '%s\n' 'nbd-monitor 0.0.1'; exit ;;
+    --help|-h) usage; exit ;;
+    run|admit|observe-start|observe-stop|disconnect|report)
+        (( $# == 2 )) || die "invalid_arguments"
+        [[ $2 =~ ^nbd(0|[1-9][0-9]*)$ ]] || die "invalid_device" ;;
+    *) usage >&2; exit 1 ;;
+esac
+device=$2
+if [[ $1 == report ]]; then report; exit; fi
+valid_id "${INVOCATION_ID:-}" || die "missing_invocation"
+directory=$runtime/$device
+mkdir -p -- "$directory"
+case $1 in
+    run) run ;;
+    admit) admit ;;
+    observe-start) observe_start ;;
+    observe-stop) observe_stop ;;
+    disconnect) disconnect ;;
 esac
