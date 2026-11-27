@@ -8,6 +8,10 @@
 
 > 核心目标：服务端能够直接拥有每个 Run 的最小完整退出档案；Prometheus 只读取服务端，Grafana 以独立 Run 为单位进行逐轮退出结果交叉分析。
 
+## v0.0.2 实施补充
+
+v0.0.1 的下列线协议、截止及状态机保持不变。v0.0.2 将客户端 Close Exchange 移入原生 nbd@ 的 ExecStopPost=finalize，monitor 只负责运行期心跳；通信窗口仍为 150 秒，从有效 finalize 起计。原生停止作业包含交接，但 stop 返回码不代表 normal，须依据本轮 final 和 Journal。原生 nbd@ 停止预算 180 秒，monitor 10 秒只清理进程。其余长期设计中的 disconnect/monitor 停止语义为历史背景，不作为本版接线。日志降噪不改变协议周期或终态证据。
+
 ## v0.0.1 实施范围
 
 下列规则用于首版脚本与实机验收。§1～§12 保留长期契约、字段候选和扩展用例。

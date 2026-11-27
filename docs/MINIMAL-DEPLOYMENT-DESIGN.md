@@ -4,9 +4,9 @@
 - **设计版本**：v0.1
 - **日期**：2026-11-26
 - **项目**：SiliCAT/nbd-monitor
-- **工程基线**：v0.0.1，`main` 提交 `944e1639ed5647a8a2b9f5d8a50cad75831c99d6`
+- **工程基线**：v0.0.2，基于已验收正常路径的 v0.0.1 提交 `5f654b66ef4d74819014111aaf1073815938edef`
 - **上位契约**：[CLOSE-EXCHANGE-DESIGN.md](CLOSE-EXCHANGE-DESIGN.md)（设计 v0.1，文首列出 v0.0.1 实施范围）
-- **状态**：v0.0.1 Bash 脚本已实现，控制端口为 TCP 11120。systemd 和内核 NBD 联动仍待实机验收。
+- **状态**：v0.0.2 将退出交接移入原生停止后钩子，控制端口仍为 TCP 11120。本版停止边界、并发和日志降噪待实机验收。
 
 > **目标：以尽可能薄的实机接入层验证 NBD 的连接、读写、正常退出、事实记录和再次连接。**
 
@@ -26,7 +26,7 @@
 - 以 Run 为分析实体，记录正常或失败判定，以及相应的退出事实和交接结果。
 - M0 作为历史技术资产，不作为新版行为兼容规范。可按需复用经过验证的事实采集实现；不恢复其独立观察框架。
 - 首个最小系统只承担原生连接、生命周期接入、退出事实交接与诊断，不实施主动故障恢复或镜像维护。
-- v0.0.1 已实现脚本流程，systemd 单元和配置采用正式文件名交付，仍待实机验收。
+- v0.0.1 正常无挂载路径已实机六轮通过；v0.0.2 修订停止边界及日志，仍待本版实机验收。
 
 ## 2. 首个实机可用版本的功能边界
 
@@ -39,7 +39,7 @@
 | M03 | 准入及 Run / Session 关联 | 同一资源先到先得，获得准入后才执行原生连接。每轮身份独立。 |
 | M04 | 运行阶段 heartbeat | 关联服务端 Run、监护会话并在退出时切换。 |
 | M05 | 原生 detach 执行事实 | 区分未执行、成功、失败、信号终止和未知等实际情况。 |
-| M06 | 客户端设备事实 | 采集原生停止后的设备状态。缺少 hook 记录时，在 `disconnect` 中读取当前设备状态。 |
+| M06 | 客户端设备事实 | 在 `finalize` 中采集原生停止后的设备状态；未知保持 unknown。 |
 | M07 | 服务端进程及残留事实 | QEMU 退出事实、进程身份与必要的 A3 残留观测。 |
 | M08 | Close Exchange | 不以成功解除为前提；多次双向事实交换。 |
 | M09 | 首版退出判定 | 按核心契约文首的唯一成功路径，完成 `close → ready → confirm → complete`。 |
@@ -121,7 +121,7 @@ nbd-scan.timer → nbd-scan.service → scan → 观察与超时结论
 
 使用 `/etc/nbdtab`、Debian 原生 `nbd@nbdN.service` 和 `/usr/sbin/nbd-client` 负责真实连接及 detach。上层挂载由现有 fstab、systemd automount 或 autofs 管理。本项目不增加挂载管理器，不代替原生 ExecStart/ExecStop，不修改文件系统数据。
 
-`nbd-monitor@.service` 和 `nbd@.service.d/monitor.conf` 负责接入原生单元。模板使用 `ExecStartPre=admit`、`ExecStartPost=observe-start` 和 `ExecStopPost=observe-stop`；依赖和实际调用顺序须在目标机验证。
+`nbd-monitor@.service` 和 `nbd@.service.d/monitor.conf` 负责接入原生单元。模板使用 `ExecStartPre=admit`、`ExecStartPost=observe-start` 和 `ExecStopPost=finalize`；依赖和实际调用顺序须在目标机验证。
 
 ### 4.2 启动时间轴
 
@@ -144,22 +144,22 @@ monitor 启动并报告 READY
      ↓
 原生 ExecStop：nbd-client -d /dev/nbdN
      ↓
-原生 ExecStopPost：取得并交接原生执行及设备事实
+原生 ExecStopPost：finalize，记录 stopping 并采集原生执行及设备事实
      ↓
-monitor ExecStop：disconnect
-     ↓
-退出阶段接管：停止普通 heartbeat，尽早发送 close
+在 heartbeat.lock 内完成在途心跳与事实交接，尽早发送 close
      ↓
 必要的设备事实复查、双端事实交换及最终确认
      ↓
 收到最终结果，或因超时、控制错误结束
      ↓
-本地退出摘要进入 Journal
+本地 final 原子替换，退出摘要进入 Journal
+     ↓
+原生停止作业结束；monitor 随后仅清理后台进程
 ```
 
 实际发生的原生动作可能失败、未执行或无可靠记录。退出时间轴是接入目标，不可当作动作一定执行的证据。即使本地设备仍连接或未知，身份有效且控制通道可用时也应尽力交接退出事实；缺失原生证据不阻断 close。不能确认身份时不得冒用会话。
 
-普通 heartbeat 到 close 的切换由明确的生命周期阶段驱动，而不是以设备归零为门槛。处理正在进行的 heartbeat、并行的 run/disconnect、重复 stop 等竞态；旧 heartbeat 不得使退出阶段回退或延长截止。首个版本无补做动作，故退出事实收口无需等待补做循环。
+普通 heartbeat 到 close 的切换由明确的生命周期阶段驱动，而不是以设备归零为门槛。处理正在进行的 heartbeat、并行的 run/finalize、重复 stop 等竞态；旧 heartbeat 不得使退出阶段回退或延长截止。首个版本无补做动作，故退出事实收口无需等待补做循环。
 
 文件系统一致性通过实机读回验收。上层业务尚未安全卸载时不得为测试而强行 detach。
 
@@ -169,16 +169,19 @@ monitor ExecStop：disconnect
 |---|---|
 | 服务端退出及交接 | **120s**，到期记为失败并阻断同一资源的新准入。 |
 | 客户端主动 Close Exchange | **150s** 上限，收到最终结果或请求超时可提前结束。 |
-| monitor / export `TimeoutStopSec` | **180s** 模板预算，实机核验各停止作业。 |
+| 原生 nbd@ / export `TimeoutStopSec` | **180s** 模板预算，实机核验各停止阶段。 |
+| monitor `TimeoutStopSec` | **10s**，只清理后台进程。 |
 | 准入有效期、heartbeat 间隔 / 失联阈值 | 30s，10s / 30s。 |
 | 常规 close 间隔 / 单次控制请求上限 | 5s / 2s。收到 `ready` 后立即确认。 |
 | 扫描周期 | 5s，由系统定时器推进，截止仍以保存的时间为准。 |
 
-客户端从有效 `disconnect` 起计时，服务端从首次有效 close 或 QEMU `finish` 取较早者。双端使用各自主机的单调时钟。卸载和原生 stop 在客户端通信计时前执行。请求入口与 scan 均检查服务端截止，重复消息不续期。
+客户端从有效 `finalize` 起计时，服务端从首次有效 close 或 QEMU `finish` 取较早者。双端使用各自主机的单调时钟。卸载和原生 stop 在客户端通信计时前执行。请求入口与 scan 均检查服务端截止，重复消息不续期。
 
 120s 后保留已保存的结果。QEMU 后来退出时可补记事实，原判定和人工阻断继续有效。
 
 本阶段取消补做、Reset、镜像维护预算，无需为它们预设 270s/300s 等外部超时。所有正式超时仍需结合实际 systemd 阶段语义验证。
+
+原生 stop 作业结束意味着 finalize 已返回或被 systemd 终止，不等于双端退出成功。必须匹配本轮 native Invocation / Session / Run 的 final 与 Journal；缺失或异常终止为未确认。不得在原生 hook 中同步等待 monitor 停止，否则会违反逆序停止依赖。
 
 ## 6. 极简配置、状态和日志
 
@@ -214,7 +217,7 @@ nbd0 192.0.2.10 TEST port=10920
 
 ### 6.2 客户端状态
 
-使用现有 `/run/nbd-monitor/<device>/` 或等价临时目录保存会话上下文、运行/退出事实和必要的锁。文件数量服从写入者、生命周期和并发安全，而非数量指标。原生 hook 的交接记录可以独立保存；不新增客户端持久化队列、日志文件或真实文件系统状态。
+使用现有 `/run/nbd-monitor/<device>/` 或等价临时目录保存会话上下文、运行/退出事实和必要的锁。文件数量服从写入者、生命周期和并发安全，而非数量指标。原生 hook 的交接记录可以独立保存；heartbeat.lock 仅保护单次心跳及 binding/fault 保存，finalize 写 stopping 后等待最多 4 秒并重查事实，超时按失败、不宣称正常。final 为七行：native Invocation、Session、Run（未知为 -）、result、reason、native、device。未确认准入不发送 close，保留失败证据；其他 Invocation 不得冒用旧记录。不新增客户端持久化队列、日志文件或真实文件系统状态。
 
 临时目录和身份关联须防止跨启动、跨设备、跨 Session 串写。Journal 作为详细现场证据来源；缺少有效交接记录时汇报 unknown。
 
@@ -229,7 +232,7 @@ nbd0 192.0.2.10 TEST port=10920
 └── <session>.state
 ```
 
-`current` 指向该资源当前 Session。服务端以同目录原子替换提交结果，成功后返回确认。旧轮移出 `current` 且终态已满 150 秒后，scan 可清理其临时记录。诊断历史在 Journal，跨重启保留取决于系统配置。
+`current` 指向该资源当前 Session。服务端以同目录原子替换提交结果，成功后返回确认。旧轮移出 `current` 且终态已满 150 秒后，scan 可清理其临时记录。诊断历史在 Journal，跨重启保留取决于系统配置。control 和 scan 单元设置 LogLevelMax=notice、SyslogLevel=notice；不调整心跳或扫描时限，不抑制脚本退出事实。
 
 单元重启保留 `/run` 中的当前状态和阻断。整机重启后旧 Session、期限和阻断全部失效，服务端重新按当前资源开放准入。长期持久化档案及旧版状态迁移留待后续评估。
 

@@ -377,7 +377,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.1'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.2'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;

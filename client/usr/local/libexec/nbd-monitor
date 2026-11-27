@@ -208,62 +208,107 @@ observe_start() {
 }
 
 observe_stop() {
-    load_context && [[ $native_id == "$INVOCATION_ID" ]] || return 0
-    save_local stopping "$native_id"
+    save_local stopping "$native_id" || die "stopping_save_failed"
     native_stop_status
     device_status
-    save_local stopped "$native_id" "$native" "$observed_device"
+    save_local stopped "$native_id" "$native" "$observed_device" || die "stopped_save_failed"
     log "event=native_stop native_invocation=$native_id native=$native code=$native_code status=$native_status device=$observed_device"
 }
 
+heartbeat_allowed() {
+    load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] &&
+        marker online && ! marker stopping && ! marker closing && ! marker fault
+}
+
 run() {
-    local next_heartbeat=0 last_native='' fault run_id=''
+    local next_heartbeat=0 last_native='' fault run_id='' heartbeat_fd
+    exec {heartbeat_fd}>"$directory/heartbeat.lock"
     save_local monitor "$INVOCATION_ID"
     "$notify" --ready
     while :; do
-        if load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] &&
-            marker online && ! marker stopping && ! marker closing && ! marker fault; then
+        if heartbeat_allowed; then
             if [[ $last_native != "$native_id" ]]; then
                 next_heartbeat=0 last_native=$native_id run_id=
             fi
             tick
-            if (( now >= next_heartbeat )); then
-                fault=-
-                if ! control "$request_window" heartbeat; then
-                    fault=$control_fault
-                elif [[ $reply == failed || $reply == rejected || ( $reply != active && $reply != closing ) ]] ||
-                    ! valid_id "$reply_run" || [[ -n $run_id && $run_id != "$reply_run" ]]; then
-                    fault=control_error
-                else
-                    run_id=$reply_run
-                    save_local binding "$native_id" "$run_id"
+            if (( now >= next_heartbeat )) && flock -n "$heartbeat_fd"; then
+                # Recheck after locking: finalize may have declared stopping.
+                if heartbeat_allowed && [[ $native_id == "$last_native" ]]; then
+                    fault=-
+                    if ! control "$request_window" heartbeat; then
+                        fault=$control_fault
+                    elif [[ $reply == failed || $reply == rejected || ( $reply != active && $reply != closing ) ]] ||
+                        ! valid_id "$reply_run" || [[ -n $run_id && $run_id != "$reply_run" ]]; then
+                        fault=control_error
+                    else
+                        save_local binding "$native_id" "$reply_run" || die "binding_save_failed"
+                        if [[ -z $run_id ]]; then log "event=heartbeat_bound run=$reply_run"; fi
+                        run_id=$reply_run
+                    fi
+                    if [[ $fault != - ]]; then
+                        save_local fault "$native_id" "$fault" || die "fault_save_failed"
+                        log "event=heartbeat_failed reason=$fault server_reason=${reply_reason:--}"
+                    fi
+                    next_heartbeat=$((now + heartbeat_interval))
                 fi
-                if [[ $fault != - ]]; then
-                    save_local fault "$native_id" "$fault"
-                    log "event=heartbeat_failed reason=$fault server_reason=${reply_reason:--}"
-                fi
-                next_heartbeat=$((now + heartbeat_interval))
+                flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
             fi
         fi
         sleep 1
     done
 }
 
-disconnect() {
+record_final() {
+    local result=$1 reason=$2 run=$3 native=$4 observed_device=$5
+    save_local final "$native_id" "$session" "$run" "$result" "$reason" "$native" "$observed_device" ||
+        die "final_save_failed"
+    if [[ $result == normal ]]; then
+        log "event=exit result=normal run=$run native=$native device=$observed_device"
+        return 0
+    fi
+    log "event=exit result=failed reason=$reason run=$run native=$native device=$observed_device"
+    return 1
+}
+
+finalize() {
     local deadline native=unknown observed_device=unknown fault=- expected_run='' reason
-    local -a facts=() saved=()
+    local close_fd heartbeat_fd
+    local -a saved=()
     exec {close_fd}>"$directory/close.lock"
-    flock -w 1 "$close_fd" || die "disconnect_lock_timeout"
-    load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] || return 0
-    ! marker closing || return 0
+    flock -w 1 "$close_fd" || die "finalize_lock_timeout"
+    if [[ ! -e $directory/context ]]; then
+        log "event=finalize_skipped reason=no_context"
+        return 0
+    fi
+    load_context || die "invalid_context"
+    if [[ $native_id != "$INVOCATION_ID" ]]; then
+        log "event=finalize_skipped reason=other_invocation"
+        return 0
+    fi
+    if [[ -r $directory/final ]]; then
+        mapfile -t saved < "$directory/final"
+        if (( ${#saved[@]} == 7 )) && [[ ${saved[0]} == "$native_id" && ${saved[1]} == "$session" ]]; then
+            [[ ${saved[3]} == normal ]]
+            return
+        fi
+    fi
     tick
     deadline=$((now + close_window))
-    save_local closing "$native_id"
-    if [[ -r $directory/stopped ]] && mapfile -t facts < "$directory/stopped" &&
-        [[ ${facts[0]:-} == "$native_id" ]]; then
-        native=${facts[1]:-unknown} observed_device=${facts[2]:-unknown}
-    else
-        device_status
+    observe_stop
+    if [[ $admission != admitted ]]; then
+        record_final failed admission_unconfirmed - "$native" "$observed_device"
+        return
+    fi
+    if marker closing; then
+        record_final failed close_incomplete - "$native" "$observed_device"
+        return
+    fi
+    save_local closing "$native_id" || die "closing_save_failed"
+    # Wait for any in-flight heartbeat and its binding/fault publication.
+    exec {heartbeat_fd}>"$directory/heartbeat.lock"
+    if ! flock -w 4 "$heartbeat_fd"; then
+        record_final failed heartbeat_handoff_timeout - "$native" "$observed_device"
+        return
     fi
     if [[ -r $directory/fault ]] && mapfile -t saved < "$directory/fault" &&
         [[ ${saved[0]:-} == "$native_id" ]]; then
@@ -273,6 +318,8 @@ disconnect() {
         [[ ${saved[0]:-} == "$native_id" ]]; then
         expected_run=${saved[1]:-}
     fi
+    flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
+    exec {heartbeat_fd}>&-
 
     local verb=close buffer=50
     local -a payload=("$native" "$observed_device" "$fault")
@@ -303,13 +350,12 @@ disconnect() {
                 verb=confirm
                 payload=("$expected_run") ;;
             confirm:complete)
-                log "event=exit result=normal run=$expected_run native=$native device=$observed_device"
+                record_final normal - "$expected_run" "$native" "$observed_device"
                 return 0 ;;
             *) reason=unexpected_reply; break ;;
         esac
     done
-    log "event=exit result=failed reason=$reason run=${expected_run:--} native=$native device=$observed_device"
-    return 1
+    record_final failed "$reason" "${expected_run:--}" "$native" "$observed_device"
 }
 
 report() {
@@ -324,12 +370,12 @@ report() {
     esac
 }
 
-usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|observe-stop|disconnect|report DEVICE'; }
+usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.1'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.2'; exit ;;
     --help|-h) usage; exit ;;
-    run|admit|observe-start|observe-stop|disconnect|report)
+    run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"
         [[ $2 =~ ^nbd(0|[1-9][0-9]*)$ ]] || die "invalid_device" ;;
     *) usage >&2; exit 1 ;;
@@ -343,6 +389,5 @@ case $1 in
     run) run ;;
     admit) admit ;;
     observe-start) observe_start ;;
-    observe-stop) observe_stop ;;
-    disconnect) disconnect ;;
+    finalize) finalize ;;
 esac

@@ -13,6 +13,9 @@ ExecStart=/usr/local/libexec/nbd-server scan
 StandardInput=null
 StandardOutput=journal
 StandardError=journal
+# Suppress routine PID 1 lifecycle chatter, preserve script evidence.
+LogLevelMax=notice
+SyslogLevel=notice
 
 TimeoutStartSec=10min
 TimeoutStopSec=10s

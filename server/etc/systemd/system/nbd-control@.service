@@ -14,6 +14,9 @@ ExecStart=/usr/local/libexec/nbd-server request
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
+# Suppress routine PID 1 lifecycle chatter, preserve script evidence.
+LogLevelMax=notice
+SyslogLevel=notice
 
 RuntimeMaxSec=5s
 TimeoutStopSec=1s
