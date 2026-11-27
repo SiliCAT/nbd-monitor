@@ -8,6 +8,27 @@
 
 > 核心目标：服务端能够直接拥有每个 Run 的最小完整退出档案；Prometheus 只读取服务端，Grafana 以独立 Run 为单位进行逐轮退出结果交叉分析。
 
+## v0.0.3 实施补充：confirm 有界通信重试（待实机验收）
+
+在 v0.0.2 的原生 finalize 停止边界内，仅恢复长期契约 §6.3 的末次确认幂等重试。不引入新的通信窗口、协议、字段、配置或服务端状态机。v0.0.2 正常路径、三种产品超时和 S15.3-A/B/C 控制请求截留及恢复已完成实机验收；本版新增行为仍需专项验收。
+
+| 决议 | 实施约束 |
+|---|---|
+| R01/R10 | 仅 confirm 阶段重试通信失败；admit、heartbeat、close 不重试通信失败。 |
+| R02/R03 | 单次请求 2s，失败后等待 1s；不另设次数上限。原始 finalize 150s 硬截止不续期。 |
+| R04 | 原样重发同一协议版本、port、Session、Run 的 confirm；不回退 close，不重复 detach。 |
+| R05 | 内部分 transport、timeout、protocol、local_error。只重试 transport/timeout；明确 failed/rejected、协议和身份错误立即终止。截断或无换行的 EOF 视为未取得完整回复；完整非法回复不重试。 |
+| R06 | 合法且身份匹配的 complete（reason=-）可正常退出；confirm 瞬时故障不写入运行期 heartbeat fault。 |
+| R07 | 预算不足时不再发起请求。保留最后通信故障或明确业务/协议失败原因，最终确认未取得则 failed。 |
+| R08 | 服务端 120s 判定截止、150s 历史重放窗口、原生 180s 停止预算、现有七/十七行状态格式不变。已提交 normal 不因 ACK 丢失撤销。 |
+| R09 | 只在重试路径记录 confirm_retry_begin、confirm_retry_recovered、confirm_retry_exhausted 或 confirm_retry_stopped（明确错误终止）；attempts 含首次 confirm，正常无重试路径不增加日志。 |
+
+发请求前要求剩余预算严格大于 2s + 0.5s；失败后进入重试等待前要求严格大于 1s + 2s + 0.5s，等待后再次核验。任何时候最多一个请求在途。内部分类不扩大对外 reason 枚举；保留旧版 137 退出码对应 control_timeout 的原因，但无法确认来源的 SIGKILL 不作为可重试传输错误。
+
+服务端既有 confirm 重放用于取得已提交的结果；若首次 confirm 未送达且服务端先到期，收到 failed/close_timeout 即结束。客户端始终未收到 complete 时保持 failed，不能推断服务端是否提交。服务端确认成功后可重新准入，不增加 ACK 的 ACK。
+
+专项实机验收：一次/连续 complete 丢失、confirm 请求丢失、全部回复丢失有界退出、首次确认始终未到达后明确超时、错误 Session/Run/非法回复不重试、旧确认在新 Session 活跃期间幂等重放、无故障路径回归，以及已验收 A/B/C 不变。v0.0.2 的 D 场景实际基线尚未实机取得；不得将推导或模拟当作实机通过。
+
 ## v0.0.2 实施补充
 
 v0.0.1 的下列线协议、截止及状态机保持不变。v0.0.2 将客户端 Close Exchange 移入原生 nbd@ 的 ExecStopPost=finalize，monitor 只负责运行期心跳；通信窗口仍为 150 秒，从有效 finalize 起计。原生停止作业包含交接，但 stop 返回码不代表 normal，须依据本轮 final 和 Journal。原生 nbd@ 停止预算 180 秒，monitor 10 秒只清理进程。其余长期设计中的 disconnect/monitor 停止语义为历史背景，不作为本版接线。日志降噪不改变协议周期或终态证据。

@@ -9,7 +9,7 @@ runtime=${NBD_MONITOR_RUNTIME:-/run/nbd-monitor}
 sysfs=${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}
 systemctl=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
 notify=${NBD_MONITOR_NOTIFY:-/usr/bin/systemd-notify}
-readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000
+readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000 confirm_retry_interval=100
 
 log() { printf 'nbd-monitor device=%s session=%s %s\n' "${device:--}" "${session:--}" "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -157,24 +157,33 @@ control() {
     local duration
     printf -v duration '%d.%02ds' "$((budget / 100))" "$((budget % 100))"
     control_fault=control_error
+    control_class=local_error
     reply_reason=-
-    # The timed child expands its own arguments and owns the TCP socket.
+    # The timed child owns the TCP socket; distinguish transport from protocol failure.
     # shellcheck disable=SC2016
     if line=$(timeout "$duration" bash -c '
-        exec 3<>"/dev/tcp/$1/11120" || exit 1
+        exec 3<>"/dev/tcp/$1/11120" || exit 10
         shift
-        printf "%s\n" "$*" >&3 || exit 1
-        IFS= read -r -n 513 reply <&3 && (( ${#reply} <= 512 )) || exit 1
-        printf "%s" "$reply"
+        printf "%s\n" "$*" >&3 || exit 10
+        IFS= read -r -n 513 reply <&3 || exit 10
+        (( ${#reply} <= 512 )) || exit 11
+        printf "%s" "$reply" || exit 12
     ' bash "$host" 1 "$verb" "$port" "$session" "$@"); then
+        control_class=protocol
         read -r -a response <<< "$line"
         (( ${#response[@]} == 5 )) && [[ ${response[0]} == 1 && ${response[2]} == "$session" &&
             ${response[4]} =~ ^[a-z_-]+$ ]] || return 1
         reply=${response[1]} reply_run=${response[3]} reply_reason=${response[4]}
-        [[ $reply_run == - ]] || valid_id "$reply_run"
+        [[ $reply_run == - ]] || valid_id "$reply_run" || return 1
+        control_class=none
     else
         status=$?
-        if (( status == 124 || status == 137 )); then control_fault=control_timeout; fi
+        case $status in
+            10|141) control_class=transport ;;
+            11) control_class=protocol ;;
+            124) control_class=timeout; control_fault=control_timeout ;;
+            137) control_fault=control_timeout ;; # Preserve legacy reason; unexplained SIGKILL is not retryable.
+        esac
         return 1
     fi
 }
@@ -321,18 +330,39 @@ finalize() {
     flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
     exec {heartbeat_fd}>&-
 
-    local verb=close buffer=50
+    local verb=close buffer=50 confirm_attempts=0 confirm_pending=no confirm_exhausted=no
     local -a payload=("$native" "$observed_device" "$fault")
     reason=close_timeout
     while :; do
         tick
-        (( deadline - now > request_window + buffer )) || break
-        if ! control "$request_window" "$verb" "${payload[@]}"; then
-            reason=$control_fault
+        if (( deadline - now <= request_window + buffer )); then
+            if [[ $confirm_pending == yes ]]; then confirm_exhausted=yes; fi
             break
         fi
+        if [[ $verb == confirm ]]; then (( confirm_attempts += 1 )); fi
+        if ! control "$request_window" "$verb" "${payload[@]}"; then
+            reason=$control_fault
+            if [[ $verb != confirm || ( $control_class != transport && $control_class != timeout ) ]]; then
+                break
+            fi
+            tick
+            if (( deadline - now <= confirm_retry_interval + request_window + buffer )); then
+                confirm_exhausted=yes
+                break
+            fi
+            if (( confirm_attempts == 1 )); then
+                log "event=confirm_retry_begin reason=$reason run=$expected_run remaining_cs=$((deadline - now))"
+            fi
+            confirm_pending=yes
+            sleep 1
+            continue
+        fi
         tick
-        (( now < deadline )) || break
+        if (( now >= deadline )); then
+            if [[ $confirm_pending == yes ]]; then confirm_exhausted=yes; fi
+            break
+        fi
+        confirm_pending=no
         if [[ $reply == failed || $reply == rejected ]]; then
             reason=$reply_reason
             break
@@ -350,11 +380,20 @@ finalize() {
                 verb=confirm
                 payload=("$expected_run") ;;
             confirm:complete)
+                [[ $reply_reason == - ]] || { reason=unexpected_reply; break; }
+                if (( confirm_attempts > 1 )); then
+                    log "event=confirm_retry_recovered attempts=$confirm_attempts run=$expected_run"
+                fi
                 record_final normal - "$expected_run" "$native" "$observed_device"
                 return 0 ;;
             *) reason=unexpected_reply; break ;;
         esac
     done
+    if [[ $confirm_exhausted == yes ]]; then
+        log "event=confirm_retry_exhausted attempts=$confirm_attempts last_fault=$reason run=$expected_run"
+    elif (( confirm_attempts > 1 )); then
+        log "event=confirm_retry_stopped attempts=$confirm_attempts reason=$reason run=$expected_run"
+    fi
     record_final failed "$reason" "${expected_run:--}" "$native" "$observed_device"
 }
 
@@ -373,7 +412,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.2'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.3'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"
