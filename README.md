@@ -1,6 +1,6 @@
 # nbd-monitor
 
-**v0.0.5 — Close Exchange 统一有界通信重试（候选版，待实机验收）**
+**v0.0.6 — Heartbeat 观测与业务裁定解耦（候选版，待实机验收）**
 
 使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。其余记录为失败，保留原因和已有证据供人工分析。
 
@@ -12,7 +12,7 @@
 - 旧轮未收口或发生失败时拒绝新一轮。人工核实旧 QEMU、镜像和数据连接均已释放后，可在服务端执行 `nbd-server unlock PORT SESSION`。Session 可从 Journal 中确认，解锁记录与原始失败结果一并保留。
 - 客户端与服务端的运行状态在 `/run`。整机重启使旧准入和 Session 失效，重新按当前资源状态准入。日志进入 Journal，历史是否跨重启保留取决于系统的 Journal 配置。
 
-- 心跳仍为 10 秒、失联阈值 30 秒、扫描 5 秒；control 与 scan 单元仅过滤 info/debug 常规启停日志，脚本事实使用 notice，告警与失败保留。客户端每轮首次绑定 Run 留一条 heartbeat_bound，之后正常心跳不逐条记日志。
+- 心跳仍为 10 秒、观测缺口阈值 30 秒、扫描 5 秒。心跳只用于观测，不参与成败裁定；active 无业务截止。服务端独立记录缺口/恢复，客户端记录通信异常/恢复及首次可信 Run 绑定，正常心跳不逐条记日志。
 
 - v0.0.3 仅为 `confirm` 增加有界通信重试：单次请求 2s，失败后等待 1s，使用原始 finalize 150s 截止及 0.5s 退出余量，不另设次数上限。只重试传输故障与明确请求超时；非法回复、身份错误及业务拒绝立即收口。请求保持同一 Session / Run，重试恢复后可 normal。admit、heartbeat、close 的失败处理不变。服务端状态机、120s 截止、历史重放窗口、线协议和状态格式不变；最后确认始终未取得时客户端失败、服务端已提交的 normal 仍有效。
 
@@ -21,6 +21,8 @@
 - v0.0.5（T01）将既有 confirm 有界通信重试复用于 close：仅传输故障与明确请求超时可重试；原样重发冻结的退出事实或 Run 确认，单次 2s、重试间隔 1s、正常 waiting 轮询 5s，共用原始 finalize 150s 截止及 0.5s 余量，不增设次数上限，不重置服务端 120s 截止。合法回复结束当次重试；close/confirm 分别记录重试事件。明确失败、拒绝、协议或身份错误立即结束；admit、heartbeat、status 不变。服务端仅更新版本号。真实关机与丢包专项验收待完成。
 - 项目总体设计契约采用[超时最小化原则](docs/CLOSE-EXCHANGE-DESIGN.md#总体设计契约超时最小化原则)：超时约束业务生命周期，不替代真实业务事实；所有新增时限须说明必要性及失败后果。
 
+- v0.0.6（T02）取消 heartbeat 的客户端 fault 锁存、服务端 active 失联失败裁定及 finalize 心跳交接锁等待。新版 close 的 client_fault 固定为 -，保留线协议和原有状态格式；已有可信 Run 快照仍用于退出身份校验。服务端另存每资源当前 Session/Run 的观测记录，30s 仅为缺口观测阈值。原有准入/退出保护和人工 unlock 条件不变；active 残留若没有 finish 事实会持续独占，不自动释放。须在安全空闲时双端升级，禁止活动 Session 混用版本。长期实机观察后再决定是否移除心跳。
+ 
 ## 仓库与验证
 
 - `client/`、`server/` 对应目标主机的根文件系统路径。两个脚本分别位于 `usr/local/libexec/nbd-monitor` 和 `usr/local/libexec/nbd-server`。

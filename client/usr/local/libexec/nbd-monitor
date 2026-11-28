@@ -241,41 +241,54 @@ observe_stop() {
 
 heartbeat_allowed() {
     load_context && [[ $owner == "$INVOCATION_ID" && $admission == admitted ]] &&
-        marker online && ! marker stopping && ! marker closing && ! marker fault
+        marker online && ! marker stopping && ! marker closing
 }
 
 run() {
-    local next_heartbeat=0 last_native='' fault run_id='' heartbeat_fd
-    exec {heartbeat_fd}>"$directory/heartbeat.lock"
+    local next_heartbeat=0 last_native='' run_id='' bound=no failures=0 last_error='' detail
     save_local monitor "$INVOCATION_ID"
     "$notify" --ready
     while :; do
         if heartbeat_allowed; then
             if [[ $last_native != "$native_id" ]]; then
-                next_heartbeat=0 last_native=$native_id run_id=
+                next_heartbeat=0 last_native=$native_id run_id= bound=no failures=0 last_error=
             fi
             tick
-            if (( now >= next_heartbeat )) && flock -n "$heartbeat_fd"; then
-                # Recheck after locking: finalize may have declared stopping.
-                if heartbeat_allowed && [[ $native_id == "$last_native" ]]; then
-                    fault=-
-                    if ! control "$request_window" heartbeat; then
-                        fault=$control_fault
-                    elif [[ $reply == failed || $reply == rejected || ( $reply != active && $reply != closing ) ]] ||
-                        ! valid_id "$reply_run" || [[ -n $run_id && $run_id != "$reply_run" ]]; then
-                        fault=control_error
-                    else
-                        save_local binding "$native_id" "$reply_run" || die "binding_save_failed"
-                        if [[ -z $run_id ]]; then log "event=heartbeat_bound run=$reply_run"; fi
-                        run_id=$reply_run
+            if (( now >= next_heartbeat )); then
+                next_heartbeat=$((now + heartbeat_interval))
+                detail=-
+                if ! control "$request_window" heartbeat; then
+                    detail="$control_class:$control_fault"
+                elif [[ $reply == failed || $reply == rejected ]]; then
+                    detail="$reply:$reply_reason"
+                elif [[ ( $reply != active && $reply != closing ) || $reply_reason != - ]] ||
+                    ! valid_id "$reply_run"; then
+                    detail=invalid_reply
+                elif [[ -n $run_id && $run_id != "$reply_run" ]]; then
+                    detail=run_mismatch
+                else
+                    run_id=$reply_run
+                    # A single atomic, optional identity snapshot. Never replace a known Run.
+                    # A response arriving after stopping is not needed by finalize.
+                    if [[ $bound == no ]] && ! marker stopping && ! marker closing; then
+                        if save_local binding "$native_id" "$run_id"; then
+                            bound=yes
+                            log "event=heartbeat_bound run=$run_id"
+                        else
+                            log "event=heartbeat_observation_error reason=binding_save_failed run=$run_id"
+                        fi
                     fi
-                    if [[ $fault != - ]]; then
-                        save_local fault "$native_id" "$fault" || die "fault_save_failed"
-                        log "event=heartbeat_failed reason=$fault server_reason=${reply_reason:--}"
-                    fi
-                    next_heartbeat=$((now + heartbeat_interval))
                 fi
-                flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
+                if [[ $detail != - ]]; then
+                    (( failures += 1 ))
+                    if [[ $detail != "$last_error" ]]; then
+                        log "event=heartbeat_degraded detail=$detail failures=$failures run=${run_id:--}"
+                    fi
+                    last_error=$detail
+                elif (( failures > 0 )); then
+                    log "event=heartbeat_recovered failures=$failures run=$run_id"
+                    failures=0 last_error=
+                fi
             fi
         fi
         sleep 1
@@ -305,8 +318,8 @@ wait_local_lock() {
 }
 
 finalize() {
-    local deadline native=unknown observed_device=unknown fault=- expected_run='' reason buffer=50
-    local close_fd heartbeat_fd
+    local deadline native=unknown observed_device=unknown expected_run='' reason buffer=50
+    local close_fd
     local -a saved=()
     tick
     deadline=$((now + close_window))
@@ -338,26 +351,16 @@ finalize() {
         return
     fi
     save_local closing "$native_id" || die "closing_save_failed"
-    # Wait for any in-flight heartbeat and its binding/fault publication.
-    exec {heartbeat_fd}>"$directory/heartbeat.lock"
-    # Leave the existing request/exit allowance for the first close request.
-    if ! wait_local_lock "$heartbeat_fd" "$((deadline - request_window - buffer))"; then
-        record_final failed heartbeat_handoff_timeout - "$native" "$observed_device"
-        return
-    fi
-    if [[ -r $directory/fault ]] && mapfile -t saved < "$directory/fault" &&
-        [[ ${saved[0]:-} == "$native_id" ]]; then
-        fault=${saved[1]:-control_error}
-    fi
+    # Read an already-published atomic identity snapshot, never wait for observation.
+    # Close/confirm still independently validate Session and Run.
     if [[ -r $directory/binding ]] && mapfile -t saved < "$directory/binding" &&
-        [[ ${saved[0]:-} == "$native_id" ]]; then
-        expected_run=${saved[1]:-}
+        (( ${#saved[@]} == 2 )) && [[ ${saved[0]} == "$native_id" ]] &&
+        valid_id "${saved[1]}"; then
+        expected_run=${saved[1]}
     fi
-    flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
-    exec {heartbeat_fd}>&-
 
     local verb=close attempts=0 retry_pending=no retry_exhausted=no
-    local -a payload=("$native" "$observed_device" "$fault")
+    local -a payload=("$native" "$observed_device" -)
     reason=close_timeout
     while :; do
         tick
@@ -442,7 +445,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.5'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.6'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"

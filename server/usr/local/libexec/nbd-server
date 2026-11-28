@@ -6,7 +6,7 @@ umask 077
 config=${NBD_SERVER_CONFIG:-/etc/nbd-server.conf}
 runtime=${NBD_SERVER_RUNTIME:-/run/nbd-server}
 qemu=${NBD_SERVER_QEMU:-/usr/bin/qemu-nbd}
-readonly admission_window=3000 heartbeat_window=3000 close_window=12000 replay_window=15000
+readonly admission_window=3000 heartbeat_gap_window=3000 close_window=12000 replay_window=15000
 # These records are private to this boot and distinct from the M0 disk archive.
 readonly keys=(session client run pid start phase deadline native device client_fault qemu_result qemu_code qemu_status released result reason ended)
 declare -A images=() exports=() state=()
@@ -130,9 +130,50 @@ expire() {
     (( now >= state[deadline] )) || return 0
     case ${state[phase]} in
         reserved) fail_run admission_timeout ;;
-        active) fail_run heartbeat_timeout ;;
         closing|ready) fail_run close_timeout ;;
     esac
+}
+
+# Observation is separate from the authoritative Session state. The caller holds
+# the resource lock; failures here never create a lifecycle failure verdict.
+observe_heartbeat() {
+    local action=$1 last=$now gap=no source=export age
+    local -a observed=()
+    [[ ${state[phase]} == active ]] || return 0
+    if [[ $action != start ]]; then
+        if [[ -r $directory/heartbeat ]] && mapfile -t observed < "$directory/heartbeat" &&
+            (( ${#observed[@]} == 5 )) &&
+            [[ ${observed[0]} == "${state[session]}" && ${observed[1]} == "${state[run]}" ]] &&
+            valid_number "${observed[2]}" && (( observed[2] <= now )) &&
+            [[ ${observed[3]} == no || ${observed[3]} == yes ]] &&
+            [[ ${observed[4]} == export || ${observed[4]} == heartbeat ]]; then
+            last=${observed[2]} gap=${observed[3]} source=${observed[4]}
+        elif [[ $action == scan ]]; then
+            return 0
+        else
+            log "event=heartbeat_observation_reset session=${state[session]} run=${state[run]}"
+        fi
+        age=$((now - last))
+        if [[ $gap == no ]] && (( age >= heartbeat_gap_window )); then
+            gap=yes
+            if [[ $action == scan ]]; then
+                if ! save_file "$directory/heartbeat" "${state[session]}" "${state[run]}" "$last" "$gap" "$source"; then
+                    log "event=heartbeat_observation_error reason=save_failed session=${state[session]} run=${state[run]}"
+                    return 0
+                fi
+            fi
+            log "event=heartbeat_gap session=${state[session]} run=${state[run]} elapsed_cs=$age last_source=$source"
+        fi
+        [[ $action == receive ]] || return 0
+        if [[ $gap == yes ]]; then
+            log "event=heartbeat_recovered session=${state[session]} run=${state[run]} elapsed_cs=$age last_source=$source"
+        fi
+        last=$now gap=no source=heartbeat
+    fi
+    if ! save_file "$directory/heartbeat" "${state[session]}" "${state[run]}" "$last" "$gap" "$source"; then
+        log "event=heartbeat_observation_error reason=save_failed session=${state[session]} run=${state[run]}"
+    fi
+    return 0
 }
 
 begin_closing() {
@@ -198,7 +239,8 @@ request() {
     lock_resource
     load_current
     tick
-    expire
+    # Heartbeat reports existing state; only lifecycle operations/scan expire it.
+    if [[ $verb != heartbeat ]]; then expire; fi
     if [[ $verb == status ]]; then
         if [[ -z $current || ${state[phase]} == finished || ${state[phase]} == released ]]; then
             respond available
@@ -242,8 +284,7 @@ request() {
         heartbeat)
             case ${state[phase]} in
                 active)
-                    state[deadline]=$((now + heartbeat_window))
-                    save_state
+                    observe_heartbeat receive
                     respond active ;;
                 closing|ready) respond closing ;;
                 blocked) respond failed "${state[reason]}" ;;
@@ -312,9 +353,10 @@ export_run() {
     [[ -n $current && ${state[phase]} == reserved ]] || die "export_without_current_admission"
     read_process "$$" || die "process_identity_unavailable"
     state[run]=$INVOCATION_ID state[pid]=$$ state[start]=$process_start
-    state[phase]=active state[deadline]=$((now + heartbeat_window))
+    state[phase]=active state[deadline]=0
     save_state
     journal_run export_start
+    observe_heartbeat start
     unlock_resource
     exec "$qemu" --format=qcow2 --shared=1 "--export-name=${exports[$port]}" -- "${images[$port]}"
 }
@@ -363,6 +405,7 @@ scan() {
             load_current
             tick
             expire
+            if [[ -n $current && ${state[phase]} == active ]]; then observe_heartbeat scan; fi
             for path in "$directory/"*.state; do
                 [[ -f $path ]] || continue
                 id=${path##*/} id=${id%.state}
@@ -379,7 +422,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.5'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.6'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;

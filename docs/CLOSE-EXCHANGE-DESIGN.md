@@ -23,6 +23,27 @@
 
 涉及退出事实采集、交接及通信终止的机制，以真实 reboot/poweroff 为主要验收基准；常态测试及故障注入用于补充，不替代真实关机。原则不授权删除必要的网络、失联、资源占用或外部停止保护；具体参数与业务变更须专项审核。
 
+## 总体设计契约：运行期观测与生命周期裁定分离
+
+连接由原生 NBD 实现，独占由准入状态保证，退出由双端真实事实及交接契约裁定，运行期监控仅用于观察。独立控制通道的成功/失败不能证明 NBD 数据通道或文件系统的健康与否。观测缺失、延迟或恢复不得单独生成、撤销业务终态或授权资源释放。观测组件应可移除；是否最终取消运行期周期通信须根据长期实机证据决定。
+
+## v0.0.6 实施补充：Heartbeat 观测与业务裁定解耦（T02，待实机验收）
+
+| 决议 | 实施约束 |
+|---|---|
+| T02-01/02/04 | 客户端 heartbeat 只记录观测异常、恢复和首次可信 Run；不写终止性 fault，不因通信、协议、身份或服务端拒绝永久停止观测。新版 close 的 client_fault 固定为 -。非法回复不可绑定或覆盖可信 Run。 |
+| T02-03/06 | active 不设业务截止（deadline=0）；expire 仅处理 reserved、closing、ready。heartbeat 不调用 expire、不续期、不修改权威状态；返回已保存业务状态。原 30s 改为观测阈值。 |
+| T02-05 | 保留 10s heartbeat 周期、2s 请求保护、5s scan 与原有 systemd 单元，不增加时间参数或生产依赖。 |
+| T02-07/08 | 删除 heartbeat.lock 的持有与等待及 heartbeat_handoff_timeout 路径。finalize 只读取已原子发布、匹配本轮 Invocation 的可选可信 Run 快照，不等待在途 heartbeat；缺少快照时由现有 Session/close/confirm 完成 Run 绑定。已取得快照仍严格核对；迟到快照不是退出前置条件。 |
+| T02-09 | 保留资源独占、QEMU finish、原生 detach/设备事实、120s/150s 退出交接、明确拒绝、失败阻断及人工 unlock 的条件。既有 blocked 不因观测恢复撤销。 |
+| T02-10/11 | 正常 heartbeat 不逐条写 Journal；保留异常/恢复与缺口证据，长期实机评估观测独立价值及旧版潜在误判，再决定是否移除。 |
+
+服务端每资源 /run/nbd-server/port-PORT/heartbeat 是独立的五行临时观测记录（Session、Run、最近观测单调时钟 cs、缺口是否已记录、来源 export/heartbeat）。export 建立观察基线；有效 active heartbeat 更新记录；scan 越过 30s 时记录 heartbeat_gap，恢复时记录 heartbeat_recovered（若在两次 scan 间越界也记录）。观测写入失败记录诊断，不生成业务失败；缺失记录不能推断失联。观测读写仍使用原资源锁，故不保证没有调度/IO 竞争。active 无 finish 时持续独占，若 QEMU 已消失但 finish 事实丢失则现有 unlock（仅 blocked）不可直接使用；保守保留资源，另行研究人工处置，不新增自动释放或强制动作。
+
+线协议、七/十七行权威档案格式不变。旧版 client_fault 非空可能包含身份冲突，服务端保留其保守拒绝逻辑；不得混用双端版本或热替换活动会话。旧版状态中的 blocked 不自动迁移/解除。历史章节的 heartbeat 失联裁定、fault 锁存与退出锁等待以本节替代。
+
+验收：真实 reboot/poweroff；单次/连续丢包、回复丢失、身份错误、超过 30s 失联及恢复；超过阈值时仍拒绝新准入，业务状态保持 active；无心跳、在途 heartbeat 和无绑定均可正常 close/confirm（其余事实满足）；已有绑定不符时拒绝；QEMU 异常、退出期限、重复 confirm、既有 blocked 与人工 unlock 回归；观测记录缺失/写入失败不得产生业务失败。未实机验证不得标为实机通过。
+
 ## v0.0.5 实施补充：Close Exchange 统一有界通信重试（T01，待实机验收）
 
 | 决议 | 实施约束 |
