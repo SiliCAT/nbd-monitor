@@ -209,7 +209,7 @@ new_session() {
 }
 
 admit() {
-    local owner
+    local owner attempts=1
     read -r owner < "$directory/monitor" || die "monitor_not_ready"
     valid_id "$owner" || die "invalid_monitor_invocation"
     check_config
@@ -219,9 +219,31 @@ admit() {
     if (load_context && [[ $native_id == "$INVOCATION_ID" ]]); then die "invocation_already_attempted"; fi
     new_session
     save_local context "$owner" "$INVOCATION_ID" "$session" "$host" "$port" pending
-    control "$request_window" admit "$export_name" "$client_id" || die "admission_$control_fault"
-    [[ $reply == admitted && $reply_run == - ]] || die "admission_denied=$reply_reason"
+    # ExecStartPre is bounded by the existing systemd TimeoutStartSec.
+    # Retry only unconfirmed transport; never renew or replace this Session.
+    while ! control "$request_window" admit "$export_name" "$client_id"; do
+        if [[ $control_class != transport && $control_class != timeout ]]; then
+            if (( attempts > 1 )); then
+                log "event=admit_retry_stopped attempts=$attempts reason=$control_fault class=$control_class"
+            fi
+            die "admission_$control_fault"
+        fi
+        if (( attempts == 1 )); then
+            log "event=admit_retry_begin reason=$control_fault"
+        fi
+        sleep 1
+        (( attempts += 1 ))
+    done
+    if [[ $reply != admitted || $reply_run != - || $reply_reason != - ]]; then
+        if (( attempts > 1 )); then
+            log "event=admit_retry_stopped attempts=$attempts reply=$reply reason=$reply_reason"
+        fi
+        die "admission_denied=$reply_reason"
+    fi
     save_local context "$owner" "$INVOCATION_ID" "$session" "$host" "$port" admitted
+    if (( attempts > 1 )); then
+        log "event=admit_retry_recovered attempts=$attempts"
+    fi
     log "event=admitted client=$client_id native_invocation=$INVOCATION_ID port=$port"
 }
 
@@ -445,7 +467,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.6'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.7'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"

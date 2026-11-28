@@ -125,11 +125,30 @@ fail_run() {
     journal_run final
 }
 
+# A reservation is not a Run. Only release it automatically when no Run
+# identity or QEMU exit/release evidence has been published.
+reservation_unstarted() {
+    [[ ${state[phase]} == reserved && ${state[run]} == - &&
+       ${state[pid]} == - && ${state[start]} == - &&
+       ${state[qemu_result]} == - && ${state[qemu_code]} == - &&
+       ${state[qemu_status]} == - && ${state[released]} == no ]]
+}
+
+end_reservation() {
+    if ! reservation_unstarted; then
+        fail_run reservation_identity_conflict
+        return
+    fi
+    state[phase]=released state[result]=not_started state[reason]=$1 state[ended]=$now
+    save_state
+    journal_run "$2"
+}
+
 expire() {
     [[ -n $current ]] || return 0
     (( now >= state[deadline] )) || return 0
     case ${state[phase]} in
-        reserved) fail_run admission_timeout ;;
+        reserved) end_reservation admission_timeout admission_expired ;;
         closing|ready) fail_run close_timeout ;;
     esac
 }
@@ -251,7 +270,8 @@ request() {
     fi
     if [[ $verb == admit ]]; then
         [[ $name == "${exports[$port]}" ]] || { respond rejected export_mismatch; return; }
-        if [[ $session == "$current" && ${state[phase]} == reserved && ${state[client]} == "$client" ]]; then
+        if [[ $session == "$current" && ${state[client]} == "$client" ]] &&
+            reservation_unstarted && [[ ${state[native]} == - ]]; then
             respond admitted
         elif [[ -e $directory/$session.state ]]; then
             respond rejected session_used
@@ -293,11 +313,45 @@ request() {
         close)
             case ${state[phase]} in
                 reserved)
-                    state[native]=$native state[device]=$device state[client_fault]=$fault
-                    fail_run export_not_started
+                    if [[ ${state[native]} == - ]]; then
+                        state[native]=$native state[device]=$device state[client_fault]=$fault
+                    elif [[ ${state[native]} != "$native" || ${state[device]} != "$device" ||
+                        ${state[client_fault]} != "$fault" ]]; then
+                        respond rejected conflicting_close
+                        return
+                    else
+                        respond failed export_not_started
+                        return
+                    fi
+                    if ! reservation_unstarted; then
+                        fail_run reservation_identity_conflict
+                    elif [[ $device == connected ]]; then
+                        fail_run reservation_device_conflict
+                    elif [[ $device == disconnected ]]; then
+                        end_reservation export_not_started admission_ended
+                    else
+                        # Retain the original deadline but prevent any later export
+                        # from consuming this already-closed reservation.
+                        save_state
+                        journal_run admission_close_unconfirmed
+                        respond failed export_not_started
+                        return
+                    fi
                     respond failed "${state[reason]}"
                     return ;;
-                finished|released) respond rejected "${state[phase]}"; return ;;
+                released)
+                    if [[ ${state[result]} == not_started && ${state[reason]} == export_not_started ]]; then
+                        if [[ ${state[native]} == "$native" && ${state[device]} == "$device" &&
+                            ${state[client_fault]} == "$fault" ]]; then
+                            respond failed export_not_started
+                        else
+                            respond rejected conflicting_close
+                        fi
+                    else
+                        respond rejected released
+                    fi
+                    return ;;
+                finished) respond rejected finished; return ;;
             esac
             if [[ ${state[native]} == - ]]; then
                 state[native]=$native state[device]=$device state[client_fault]=$fault
@@ -350,7 +404,8 @@ export_run() {
     load_current
     tick
     expire
-    [[ -n $current && ${state[phase]} == reserved ]] || die "export_without_current_admission"
+    [[ -n $current ]] && reservation_unstarted &&
+        [[ ${state[native]} == - ]] || die "export_without_current_admission"
     read_process "$$" || die "process_identity_unavailable"
     state[run]=$INVOCATION_ID state[pid]=$$ state[start]=$process_start
     state[phase]=active state[deadline]=0
@@ -422,7 +477,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.6'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.7'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;

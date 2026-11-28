@@ -1,15 +1,15 @@
 # nbd-monitor
 
-**v0.0.6 — Heartbeat 观测与业务裁定解耦（候选版，待实机验收）**
+**v0.0.7 — 轻量准入及预约恢复（候选版，待实机验收）**
 
-使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。其余记录为失败，保留原因和已有证据供人工分析。
+使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。实际 Run 未满足上述条件则保守失败，保留原因和已有证据；尚未形成 Run 的预约失效独立记录，不计入 Run 退出失败。
 
 ## 启动与退出
 
-- 多个受管客户端可竞争同一资源。服务端在资源锁内确认第一个有效准入，原生 `nbd@` 的启动前置检查收到确认后才调用 nbd-client。一次准入只执行一次原生连接。
+- 当前面向一对一资源映射和受控网络；admit 仅为轻量资源预约，不认证真实客户端或绑定实际数据连接。服务端在资源锁内确认预约，原生 `nbd@` 启动前置检查收到合法确认后才调用 nbd-client，一次启动只执行一次原生连接。
 - 数据 socket 保留 `Accept=no`。服务端执行导出前复核有效准入，连接身份依靠客户端守约。应限制两个端口的网络可达范围，仅允许受管客户端访问。用 `nbd-monitor report DEVICE` 通过控制通道查询状态。控制通道 TCP 11120 未认证、未加密。
 - 上层先安全卸载，原生 `nbd@` 执行 detach，再由原生 `ExecStopPost=finalize` 采集并交换退出事实。monitor 只承担运行期心跳。服务端从首次有效 close 或 QEMU finish 取较早者开始计时，120 秒内完成判定；客户端停止阶段的通信上限为 150 秒。结构性证据缺失、明确业务失败及未恢复的通信故障按失败处理。原生 stop 作业等待 finalize 结束，但 stop 返回码不是双端 normal 的凭据；检查本轮 `/run/nbd-monitor/DEVICE/final` 与 Journal，缺少有效终态不得判为正常。
-- 旧轮未收口或发生失败时拒绝新一轮。人工核实旧 QEMU、镜像和数据连接均已释放后，可在服务端执行 `nbd-server unlock PORT SESSION`。Session 可从 Journal 中确认，解锁记录与原始失败结果一并保留。
+- 旧的实际 Run 未收口或被保护性阻断时拒绝新一轮；未形成 Run 的预约自然失效后允许重新预约。人工核实旧 QEMU、镜像和数据连接均已释放后，可在服务端执行 `nbd-server unlock PORT SESSION`。Session 可从 Journal 中确认，解锁记录与原始失败结果一并保留。
 - 客户端与服务端的运行状态在 `/run`。整机重启使旧准入和 Session 失效，重新按当前资源状态准入。日志进入 Journal，历史是否跨重启保留取决于系统的 Journal 配置。
 
 - 心跳仍为 10 秒、观测缺口阈值 30 秒、扫描 5 秒。心跳只用于观测，不参与成败裁定；active 无业务截止。服务端独立记录缺口/恢复，客户端记录通信异常/恢复及首次可信 Run 绑定，正常心跳不逐条记日志。
@@ -23,6 +23,8 @@
 
 - v0.0.6（T02）取消 heartbeat 的客户端 fault 锁存、服务端 active 失联失败裁定及 finalize 心跳交接锁等待。新版 close 的 client_fault 固定为 -，保留线协议和原有状态格式；已有可信 Run 快照仍用于退出身份校验。服务端另存每资源当前 Session/Run 的观测记录，30s 仅为缺口观测阈值。原有准入/退出保护和人工 unlock 条件不变；active 残留若没有 finish 事实会持续独占，不自动释放。须在安全空闲时双端升级，禁止活动 Session 混用版本。长期实机观察后再决定是否移除心跳。
  
+- v0.0.7（T03）admit 复用 2s 请求保护、1s 重试及 systemd ExecStartPre 启动保护；仅 transport/timeout 原样重试同一 Session，不续期、不新增超时或取消协议。未形成 Run 的 30s 预约过期记 released/not_started；reserved close 的 disconnected 结束预约、unknown 保留原期限但禁止再导出、connected 或 Run 身份矛盾保守 blocked。保留 QEMU 释放字段原值及实际 Run 保护；新旧状态不自动迁移。迟到数据连接可能落入下一预约，当前不增加清队列、冷却或真正认证机制。辅助机制的成本与收益须匹配，详见上位契约 D01～D07；双端安全空闲升级，待专项实机验收。
+
 ## 仓库与验证
 
 - `client/`、`server/` 对应目标主机的根文件系统路径。两个脚本分别位于 `usr/local/libexec/nbd-monitor` 和 `usr/local/libexec/nbd-server`。

@@ -27,6 +27,26 @@
 
 连接由原生 NBD 实现，独占由准入状态保证，退出由双端真实事实及交接契约裁定，运行期监控仅用于观察。独立控制通道的成功/失败不能证明 NBD 数据通道或文件系统的健康与否。观测缺失、延迟或恢复不得单独生成、撤销业务终态或授权资源释放。观测组件应可移除；是否最终取消运行期周期通信须根据长期实机证据决定。
 
+## 总体设计契约：辅助机制成本与业务收益匹配
+
+辅助机制的复杂度、运行成本及其引入的失败路径，必须与能够提供的实际业务收益相匹配。核心优先级为原生连接、读写、真实退出事实、实际 Run 的独占及安全收口。当前一对一映射和受控网络中的 admit 仅为辅助资源预约，不是身份认证，也不能将实际数据连接与 Session 严格绑定。未形成 Run 的预约失效独立记录，不纳入实际 Run 退出失败统计。待核心长期稳定后，专题评估真正准入的必要性、认证授权、数据连接绑定、迟到连接与并发仲裁；不提前建设成本高而收益未证实的补救机制。
+
+## v0.0.7 实施补充：轻量准入及预约恢复（T03，D01～D07 已冻结，待实机验收）
+
+| 决议 | 实施约束 |
+|---|---|
+| D01 | admit 复用 transport/timeout 分类、2s 请求和 1s 间隔；依赖 ExecStartPre 已有 TimeoutStartSec=30s，不新增客户端业务截止或重试次数。该入口由 systemd 管理，不保证脱离该单元直接调用时自行终止。请求字段及 Session/Invocation 不变；仅合法 admitted、run=-、reason=- 后保存 admitted 并允许一次原生连接。 |
+| D02 | 服务端首次预约起算 30s，重复有效 admit 原样回复、不续期。 |
+| D03 | 未形成 Run 的预约过期记 phase=released、result=not_started、reason=admission_timeout、ended=当前单调时钟；原 run/pid/start/QEMU 字段及 released=no 保留，记录 admission_expired。phase 表达预约终态，不是 QEMU 已释放的事实。身份/退出事实矛盾不得自动释放。 |
+| D04 | reserved close 冻结客户端事实：disconnected 记 released/not_started、reason=export_not_started，日志 admission_ended，回复 failed（并非实际 Run normal）；unknown 保持 reserved 和原期限，记录 admission_close_unconfirmed，回复 failed，不允许已收到 close 的预约再次 admit 或启动 export；connected 或服务端身份矛盾保守 blocked（reservation_device_conflict / reservation_identity_conflict）。重复同一 close 不改事实、不续期；冲突拒绝。当前已结束预约的相同 close 可重放失败回复；已过期或已被新 Session 替代的迟到 close 不复活旧预约。 |
+| D05 | 不新增 cancel 或失败后的补救通信；pending 未确认时沿用 finalize 的 admission_unconfirmed 本地记录，预约自然到期。 |
+| D06 | 明确拒绝、完整非法回复、身份错误、来源不明的本地失败立即结束；不等待其他预约、不新建 Session 重试。 |
+| D07 | 在一对一映射、受控网络、守约客户端范围内暂时接受数据连接不能与 Session 严格绑定的局限；旧连接可能碰到新窗口，不新增 socket 重启、清队列、冷却或认证。 |
+
+客户端重试只记录 admit_retry_begin/recovered/stopped；若 systemd 启动保护终止重试，以 unit Journal 及 pending 上下文为证据，不保证脚本末端日志。服务端过期、新预约及 export 复核在同一资源锁内串行化；不保证阻止未绑定的迟到 TCP 数据连接进入下一预约。未形成 Run 的历史记录复用原 150s 重放保留策略。原线协议、状态行数、phase 枚举、systemd 单元、依赖及已形成 Run 的保护均不变。新增 result=not_started；统计实际 Run 时以有效 Run ID 为前提，包括 Run=- 的矛盾阻断不计为实际 Run 退出失败。旧版 blocked 不自动解除，禁止在活动会话混用版本。
+
+验收：admit 请求/回复丢失、连续通信故障、明确拒绝及非法成功回复、外部启动保护终止；同一 Session 不续期且原生连接只执行一次；预约过期后新 Session 准入、旧 Session 拒绝、历史保留；reserved close 三种设备事实、重复/冲突 close、unknown 后迟到 export 拒绝；active/closing/ready/blocked 不允许新准入，既有真实 Run 正常及失败路径回归；真实 systemd/socket activation、reboot/poweroff 和迟到连接风险验证。未实机验证不得标为实机通过。
+
 ## v0.0.6 实施补充：Heartbeat 观测与业务裁定解耦（T02，待实机验收）
 
 | 决议 | 实施约束 |
