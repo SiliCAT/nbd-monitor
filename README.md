@@ -1,6 +1,6 @@
 # nbd-monitor
 
-**v0.0.7 — 轻量准入及预约恢复（候选版，待实机验收）**
+**v0.0.8 — Status 只读化（候选版，待实机验收）**
 
 使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。实际 Run 未满足上述条件则保守失败，保留原因和已有证据；尚未形成 Run 的预约失效独立记录，不计入 Run 退出失败。
 
@@ -24,6 +24,8 @@
 - v0.0.6（T02）取消 heartbeat 的客户端 fault 锁存、服务端 active 失联失败裁定及 finalize 心跳交接锁等待。新版 close 的 client_fault 固定为 -，保留线协议和原有状态格式；已有可信 Run 快照仍用于退出身份校验。服务端另存每资源当前 Session/Run 的观测记录，30s 仅为缺口观测阈值。原有准入/退出保护和人工 unlock 条件不变；active 残留若没有 finish 事实会持续独占，不自动释放。须在安全空闲时双端升级，禁止活动 Session 混用版本。长期实机观察后再决定是否移除心跳。
  
 - v0.0.7（T03）admit 复用 2s 请求保护、1s 重试及 systemd ExecStartPre 启动保护；仅 transport/timeout 原样重试同一 Session，不续期、不新增超时或取消协议。未形成 Run 的 30s 预约过期记 released/not_started；reserved close 的 disconnected 结束预约、unknown 保留原期限但禁止再导出、connected 或 Run 身份矛盾保守 blocked。保留 QEMU 释放字段原值及实际 Run 保护；新旧状态不自动迁移。迟到数据连接可能落入下一预约，当前不增加清队列、冷却或真正认证机制。辅助机制的成本与收益须匹配，详见上位契约 D01～D07；双端安全空闲升级，待专项实机验收。
+
+- v0.0.8（T04）status 仅在原资源锁内读取已保存的权威业务状态，直接回复，不调用 expire、不推进或虚拟推导状态、不生成业务终态。保留单次请求、原有超时、协议、stdout 格式及 stderr/非零退出码语义。已过期但尚未被业务入口或 scan 裁定的状态仍原样返回；available 不是准入承诺或数据通道健康证明。客户端业务代码不变，待专项实机验收。
 
 ## 仓库与验证
 

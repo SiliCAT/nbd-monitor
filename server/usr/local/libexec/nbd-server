@@ -257,9 +257,7 @@ request() {
     [[ ${images[$port]+set} ]] || { respond rejected unknown_resource; return; }
     lock_resource
     load_current
-    tick
-    # Heartbeat reports existing state; only lifecycle operations/scan expire it.
-    if [[ $verb != heartbeat ]]; then expire; fi
+    # Status is a read-only snapshot of the saved lifecycle state.
     if [[ $verb == status ]]; then
         if [[ -z $current || ${state[phase]} == finished || ${state[phase]} == released ]]; then
             respond available
@@ -268,6 +266,9 @@ request() {
         fi
         return
     fi
+    tick
+    # Heartbeat reports existing state; only lifecycle operations/scan expire it.
+    if [[ $verb != heartbeat ]]; then expire; fi
     if [[ $verb == admit ]]; then
         [[ $name == "${exports[$port]}" ]] || { respond rejected export_mismatch; return; }
         if [[ $session == "$current" && ${state[client]} == "$client" ]] &&
@@ -477,7 +478,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.7'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.8'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;
