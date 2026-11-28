@@ -232,7 +232,7 @@ respond() { printf '1 %s %s %s %s\n' "$1" "$session" "${state[run]:--}" "${2:--}
 request() {
     local line version verb name client supplied_run native device fault
     local -a parts=()
-    IFS= read -r -t 2 -n 513 line || { log "request_read_failed"; return 1; }
+    IFS= read -r -n 513 line || { log "request_read_failed"; return 1; }
     (( ${#line} <= 512 )) || return 1
     read -r -a parts <<< "$line"
     (( ${#parts[@]} >= 4 )) || return 1
@@ -478,7 +478,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.8'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.9'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;

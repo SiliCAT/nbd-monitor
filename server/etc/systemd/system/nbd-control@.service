@@ -18,7 +18,7 @@ StandardError=journal
 LogLevelMax=notice
 SyslogLevel=notice
 
-RuntimeMaxSec=5s
+RuntimeMaxSec=15s
 TimeoutStopSec=1s
 KillMode=control-group
 Restart=no

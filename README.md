@@ -1,6 +1,6 @@
 # nbd-monitor
 
-**v0.0.8 — Status 只读化（候选版，待实机验收）**
+**v0.0.9 — 时间体系收敛（候选版，待实机验收）**
 
 使用 Bash、systemd、Debian nbd-client 和 qemu-nbd，记录每个 NBD Run 的退出事实。一次正常退出需要同一 Run 的原生 detach 成功、本地设备确认解除、QEMU 正常退出并释放导出，以及在截止前完成并保存双端确认。实际 Run 未满足上述条件则保守失败，保留原因和已有证据；尚未形成 Run 的预约失效独立记录，不计入 Run 退出失败。
 
@@ -8,7 +8,7 @@
 
 - 当前面向一对一资源映射和受控网络；admit 仅为轻量资源预约，不认证真实客户端或绑定实际数据连接。服务端在资源锁内确认预约，原生 `nbd@` 启动前置检查收到合法确认后才调用 nbd-client，一次启动只执行一次原生连接。
 - 数据 socket 保留 `Accept=no`。服务端执行导出前复核有效准入，连接身份依靠客户端守约。应限制两个端口的网络可达范围，仅允许受管客户端访问。用 `nbd-monitor report DEVICE` 通过控制通道查询状态。控制通道 TCP 11120 未认证、未加密。
-- 上层先安全卸载，原生 `nbd@` 执行 detach，再由原生 `ExecStopPost=finalize` 采集并交换退出事实。monitor 只承担运行期心跳。服务端从首次有效 close 或 QEMU finish 取较早者开始计时，120 秒内完成判定；客户端停止阶段的通信上限为 150 秒。结构性证据缺失、明确业务失败及未恢复的通信故障按失败处理。原生 stop 作业等待 finalize 结束，但 stop 返回码不是双端 normal 的凭据；检查本轮 `/run/nbd-monitor/DEVICE/final` 与 Journal，缺少有效终态不得判为正常。
+- 上层先安全卸载，原生 `nbd@` 执行 detach，再由原生 `ExecStopPost=finalize` 采集并交换退出事实。monitor 只承担运行期心跳。服务端从首次有效 close 或成功 QEMU finish 被处理并进入 closing 起计 120 秒，首次 confirm 必须在此期限内被处理；客户端从进入 finalize 起计 150 秒（含事实采集及锁等待），180 秒为原生停止阶段的外层保护。三者起点不同，不保证固定 30 秒余量。结构性证据缺失、明确业务失败及未恢复的通信故障按失败处理。原生 stop 作业等待 finalize 结束，但 stop 返回码不是双端 normal 的凭据；检查本轮 `/run/nbd-monitor/DEVICE/final` 与 Journal，缺少有效终态不得判为正常。
 - 旧的实际 Run 未收口或被保护性阻断时拒绝新一轮；未形成 Run 的预约自然失效后允许重新预约。人工核实旧 QEMU、镜像和数据连接均已释放后，可在服务端执行 `nbd-server unlock PORT SESSION`。Session 可从 Journal 中确认，解锁记录与原始失败结果一并保留。
 - 客户端与服务端的运行状态在 `/run`。整机重启使旧准入和 Session 失效，重新按当前资源状态准入。日志进入 Journal，历史是否跨重启保留取决于系统的 Journal 配置。
 
@@ -26,6 +26,8 @@
 - v0.0.7（T03）admit 复用 2s 请求保护、1s 重试及 systemd ExecStartPre 启动保护；仅 transport/timeout 原样重试同一 Session，不续期、不新增超时或取消协议。未形成 Run 的 30s 预约过期记 released/not_started；reserved close 的 disconnected 结束预约、unknown 保留原期限但禁止再导出、connected 或 Run 身份矛盾保守 blocked。保留 QEMU 释放字段原值及实际 Run 保护；新旧状态不自动迁移。迟到数据连接可能落入下一预约，当前不增加清队列、冷却或真正认证机制。辅助机制的成本与收益须匹配，详见上位契约 D01～D07；双端安全空闲升级，待专项实机验收。
 
 - v0.0.8（T04）status 仅在原资源锁内读取已保存的权威业务状态，直接回复，不调用 expire、不推进或虚拟推导状态、不生成业务终态。保留单次请求、原有超时、协议、stdout 格式及 stderr/非零退出码语义。已过期但尚未被业务入口或 scan 裁定的状态仍原样返回；available 不是准入承诺或数据通道健康证明。客户端业务代码不变，待专项实机验收。
+
+- v0.0.9（T05）共享单次控制请求保护 2s→10s，服务端 control RuntimeMaxSec 5s→15s，删除独立 read -t 2（保留长度校验）及 finalize 固定 0.5s buffer。退出请求使用 min(10s, 剩余预算)，1s 重试/5s waiting 轮询同源定义，末端等待最多取剩余预算一半；每次请求前重算，截止不续期，截止后的回复不接受。120s/150s/180s 及其他时间参数不变；admit/heartbeat/status 同享 10s 单次保护，仍遵守各自原有业务规则。直接调用服务端 request 不再自带读取期限，生产入口依赖 systemd 外层保护。需安全空闲双端升级并 daemon-reload 服务端；T06 用真实开关机与耗时证据验证候选参数。
 
 ## 仓库与验证
 

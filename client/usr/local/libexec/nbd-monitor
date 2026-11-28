@@ -9,7 +9,7 @@ runtime=${NBD_MONITOR_RUNTIME:-/run/nbd-monitor}
 sysfs=${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}
 systemctl=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
 notify=${NBD_MONITOR_NOTIFY:-/usr/bin/systemd-notify}
-readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000 retry_interval=100
+readonly heartbeat_interval=1000 close_interval=500 request_window=1000 close_window=15000 retry_interval=100
 
 log() { printf 'nbd-monitor device=%s session=%s %s\n' "${device:--}" "${session:--}" "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -202,6 +202,26 @@ control() {
     fi
 }
 
+# All configured intervals use centiseconds.
+sleep_cs() {
+    local duration
+    printf -v duration '%d.%02ds' "$(($1 / 100))" "$(($1 % 100))"
+    sleep "$duration"
+}
+
+# Preserve the existing cadence while there is ample time. At the tail,
+# reserve at least half of the remaining budget for the next request.
+wait_before_request() {
+    local interval=$1 limit=$2 remaining delay
+    tick
+    remaining=$((limit - now))
+    (( remaining > 0 )) || return 1
+    delay=$interval
+    if (( delay > remaining / 2 )); then delay=$((remaining / 2)); fi
+    if (( delay > 0 )); then sleep_cs "$delay" || return 1; fi
+    return 0
+}
+
 new_session() {
     read -r session < /proc/sys/kernel/random/uuid
     session=${session//-/}
@@ -231,7 +251,7 @@ admit() {
         if (( attempts == 1 )); then
             log "event=admit_retry_begin reason=$control_fault"
         fi
-        sleep 1
+        sleep_cs "$retry_interval"
         (( attempts += 1 ))
     done
     if [[ $reply != admitted || $reply_run != - || $reply_reason != - ]]; then
@@ -340,7 +360,7 @@ wait_local_lock() {
 }
 
 finalize() {
-    local deadline native=unknown observed_device=unknown expected_run='' reason buffer=50
+    local deadline native=unknown observed_device=unknown expected_run='' reason remaining budget
     local close_fd
     local -a saved=()
     tick
@@ -386,18 +406,21 @@ finalize() {
     reason=close_timeout
     while :; do
         tick
-        if (( deadline - now <= request_window + buffer )); then
+        remaining=$((deadline - now))
+        if (( remaining <= 0 )); then
             if [[ $retry_pending == yes ]]; then retry_exhausted=yes; fi
             break
         fi
+        budget=$request_window
+        if (( budget > remaining )); then budget=$remaining; fi
         (( attempts += 1 ))
-        if ! control "$request_window" "$verb" "${payload[@]}"; then
+        if ! control "$budget" "$verb" "${payload[@]}"; then
             reason=$control_fault
             if [[ $control_class != transport && $control_class != timeout ]]; then
                 break
             fi
             tick
-            if (( deadline - now <= retry_interval + request_window + buffer )); then
+            if (( now >= deadline )); then
                 retry_exhausted=yes
                 break
             fi
@@ -405,7 +428,11 @@ finalize() {
                 log "event=${verb}_retry_begin reason=$reason run=${expected_run:--} remaining_cs=$((deadline - now))"
             fi
             retry_pending=yes
-            sleep 1
+            if ! wait_before_request "$retry_interval" "$deadline"; then
+                tick
+                if (( now >= deadline )); then retry_exhausted=yes; else reason=retry_wait_failed; fi
+                break
+            fi
             continue
         fi
         tick
@@ -434,8 +461,11 @@ finalize() {
         attempts=0 retry_pending=no reason=close_timeout
         case $verb:$reply in
             close:waiting)
-                (( deadline - now > close_interval + request_window + buffer )) || break
-                sleep 5 ;;
+                if ! wait_before_request "$close_interval" "$deadline"; then
+                    tick
+                    if (( now < deadline )); then reason=poll_wait_failed; fi
+                    break
+                fi ;;
             close:ready)
                 verb=confirm
                 payload=("$expected_run") ;;
@@ -467,7 +497,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.8'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.9'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"
