@@ -124,18 +124,31 @@ device_status() {
 }
 
 native_stop_status() {
-    local snapshot line stop='' invocation=''
+    local snapshot line stop='' invocation='' query_started query_rc
     local record='^\{ path=/usr/sbin/nbd-client ; argv\[\]=/usr/sbin/nbd-client -d /dev/'"$device"' ; ignore_errors=(yes|no) ; start_time=\[([^]]+)\] ; stop_time=\[([^]]+)\] ; pid=([0-9]+) ; code=([^ ;]+) ; status=([^ ;]+) \}$'
     local timestamp='^[A-Z][a-z]{2} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}( [^[:cntrl:]]+)?$'
     native=unknown native_code=- native_status=-
-    snapshot=$(timeout 1 "$systemctl" show -p InvocationID -p ExecStop "nbd@$device.service") || return 0
+    # Use the manager's native IPC timeout and the outer stop protection.
+    tick
+    query_started=$now
+    if snapshot=$("$systemctl" show -p InvocationID -p ExecStop "nbd@$device.service"); then
+        tick
+        native_query_cs=$((now - query_started))
+    else
+        query_rc=$?
+        tick
+        native_query_cs=$((now - query_started))
+        log "event=native_stop_query_failed rc=$query_rc elapsed_cs=$native_query_cs"
+        return 0
+    fi
     while IFS= read -r line; do
         case $line in
             InvocationID=*) invocation=${line#*=} ;;
             ExecStop=*) stop=${line#*=} ;;
         esac
     done <<< "$snapshot"
-    [[ $invocation == "$native_id" && $stop =~ $record ]] || return 0
+    [[ $invocation == "$native_id" ]] || { log "event=native_stop_record_rejected reason=invocation_mismatch"; return 0; }
+    [[ $stop =~ $record ]] || { log "event=native_stop_record_rejected reason=record_mismatch"; return 0; }
     local started=${BASH_REMATCH[2]} stopped=${BASH_REMATCH[3]} stop_pid=${BASH_REMATCH[4]}
     native_code=${BASH_REMATCH[5]} native_status=${BASH_REMATCH[6]}
     if [[ $started == n/a && $stopped == n/a && $stop_pid == 0 && $native_code == '(null)' &&
@@ -148,6 +161,7 @@ native_stop_status() {
             killed|dumped) if [[ ${native_status%%/*} != 0 ]]; then native=signaled; fi ;;
         esac
     fi
+    [[ $native != unknown ]] || log "event=native_stop_record_rejected reason=unclassified_record"
 }
 
 control() {
@@ -217,11 +231,12 @@ observe_start() {
 }
 
 observe_stop() {
+    local native_query_cs=-
     save_local stopping "$native_id" || die "stopping_save_failed"
     native_stop_status
     device_status
     save_local stopped "$native_id" "$native" "$observed_device" || die "stopped_save_failed"
-    log "event=native_stop native_invocation=$native_id native=$native code=$native_code status=$native_status device=$observed_device"
+    log "event=native_stop native_invocation=$native_id native=$native code=$native_code status=$native_status device=$observed_device query_cs=$native_query_cs"
 }
 
 heartbeat_allowed() {
@@ -279,12 +294,24 @@ record_final() {
     return 1
 }
 
+# Local lock waits share the existing finalize budget, not independent short limits.
+wait_local_lock() {
+    local fd=$1 limit=$2 remaining duration
+    tick
+    remaining=$((limit - now))
+    (( remaining > 0 )) || return 1
+    printf -v duration '%d.%02d' "$((remaining / 100))" "$((remaining % 100))"
+    flock -w "$duration" "$fd"
+}
+
 finalize() {
-    local deadline native=unknown observed_device=unknown fault=- expected_run='' reason
+    local deadline native=unknown observed_device=unknown fault=- expected_run='' reason buffer=50
     local close_fd heartbeat_fd
     local -a saved=()
+    tick
+    deadline=$((now + close_window))
     exec {close_fd}>"$directory/close.lock"
-    flock -w 1 "$close_fd" || die "finalize_lock_timeout"
+    wait_local_lock "$close_fd" "$deadline" || die "finalize_lock_timeout"
     if [[ ! -e $directory/context ]]; then
         log "event=finalize_skipped reason=no_context"
         return 0
@@ -301,8 +328,6 @@ finalize() {
             return
         fi
     fi
-    tick
-    deadline=$((now + close_window))
     observe_stop
     if [[ $admission != admitted ]]; then
         record_final failed admission_unconfirmed - "$native" "$observed_device"
@@ -315,7 +340,8 @@ finalize() {
     save_local closing "$native_id" || die "closing_save_failed"
     # Wait for any in-flight heartbeat and its binding/fault publication.
     exec {heartbeat_fd}>"$directory/heartbeat.lock"
-    if ! flock -w 4 "$heartbeat_fd"; then
+    # Leave the existing request/exit allowance for the first close request.
+    if ! wait_local_lock "$heartbeat_fd" "$((deadline - request_window - buffer))"; then
         record_final failed heartbeat_handoff_timeout - "$native" "$observed_device"
         return
     fi
@@ -330,7 +356,7 @@ finalize() {
     flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
     exec {heartbeat_fd}>&-
 
-    local verb=close buffer=50 confirm_attempts=0 confirm_pending=no confirm_exhausted=no
+    local verb=close confirm_attempts=0 confirm_pending=no confirm_exhausted=no
     local -a payload=("$native" "$observed_device" "$fault")
     reason=close_timeout
     while :; do
@@ -412,7 +438,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.3'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.4'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"

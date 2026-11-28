@@ -64,7 +64,9 @@ lock_resource() {
     directory=$runtime/port-$port
     mkdir -p -- "$directory"
     exec {resource_fd}>"$directory/lock"
-    flock -w 1 "$resource_fd" || die "resource_lock_timeout"
+    # Serialize state transitions and retain already-produced finish facts.
+    # Request/scan/export service limits still provide outer protection.
+    flock -x "$resource_fd" || die "resource_lock_failed"
 }
 
 unlock_resource() { exec {resource_fd}>&-; }
@@ -377,7 +379,7 @@ scan() {
 usage() { printf '%s\n' 'usage: nbd-server request | scan | export PORT | finish PORT | unlock PORT SESSION'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-server 0.0.3'; exit ;;
+    --version) printf '%s\n' 'nbd-server 0.0.4'; exit ;;
     --help|-h) usage; exit ;;
     request|scan) (( $# == 1 )) || die "invalid_arguments" ;;
     export|finish) (( $# == 2 )) || die "invalid_arguments"; valid_port "$2" || die "invalid_port" ;;
