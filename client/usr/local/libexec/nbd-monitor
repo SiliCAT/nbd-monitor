@@ -9,7 +9,7 @@ runtime=${NBD_MONITOR_RUNTIME:-/run/nbd-monitor}
 sysfs=${NBD_MONITOR_SYS_CLASS_BLOCK:-/sys/class/block}
 systemctl=${NBD_MONITOR_SYSTEMCTL:-/usr/bin/systemctl}
 notify=${NBD_MONITOR_NOTIFY:-/usr/bin/systemd-notify}
-readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000 confirm_retry_interval=100
+readonly heartbeat_interval=1000 close_interval=500 request_window=200 close_window=15000 retry_interval=100
 
 log() { printf 'nbd-monitor device=%s session=%s %s\n' "${device:--}" "${session:--}" "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -356,39 +356,38 @@ finalize() {
     flock -u "$heartbeat_fd" || die "heartbeat_unlock_failed"
     exec {heartbeat_fd}>&-
 
-    local verb=close confirm_attempts=0 confirm_pending=no confirm_exhausted=no
+    local verb=close attempts=0 retry_pending=no retry_exhausted=no
     local -a payload=("$native" "$observed_device" "$fault")
     reason=close_timeout
     while :; do
         tick
         if (( deadline - now <= request_window + buffer )); then
-            if [[ $confirm_pending == yes ]]; then confirm_exhausted=yes; fi
+            if [[ $retry_pending == yes ]]; then retry_exhausted=yes; fi
             break
         fi
-        if [[ $verb == confirm ]]; then (( confirm_attempts += 1 )); fi
+        (( attempts += 1 ))
         if ! control "$request_window" "$verb" "${payload[@]}"; then
             reason=$control_fault
-            if [[ $verb != confirm || ( $control_class != transport && $control_class != timeout ) ]]; then
+            if [[ $control_class != transport && $control_class != timeout ]]; then
                 break
             fi
             tick
-            if (( deadline - now <= confirm_retry_interval + request_window + buffer )); then
-                confirm_exhausted=yes
+            if (( deadline - now <= retry_interval + request_window + buffer )); then
+                retry_exhausted=yes
                 break
             fi
-            if (( confirm_attempts == 1 )); then
-                log "event=confirm_retry_begin reason=$reason run=$expected_run remaining_cs=$((deadline - now))"
+            if [[ $retry_pending == no ]]; then
+                log "event=${verb}_retry_begin reason=$reason run=${expected_run:--} remaining_cs=$((deadline - now))"
             fi
-            confirm_pending=yes
+            retry_pending=yes
             sleep 1
             continue
         fi
         tick
         if (( now >= deadline )); then
-            if [[ $confirm_pending == yes ]]; then confirm_exhausted=yes; fi
+            if [[ $retry_pending == yes ]]; then retry_exhausted=yes; fi
             break
         fi
-        confirm_pending=no
         if [[ $reply == failed || $reply == rejected ]]; then
             reason=$reply_reason
             break
@@ -397,7 +396,17 @@ finalize() {
             reason=run_mismatch
             break
         fi
+        case $verb:$reply in
+            close:waiting|close:ready|confirm:complete)
+                [[ $reply_reason == - ]] || { reason=unexpected_reply; break; } ;;
+            *) reason=unexpected_reply; break ;;
+        esac
         expected_run=$reply_run
+        if [[ $retry_pending == yes ]]; then
+            log "event=${verb}_retry_recovered attempts=$attempts run=$expected_run"
+        fi
+        # A validated reply ends this retry episode; ordinary polling is not retrying.
+        attempts=0 retry_pending=no reason=close_timeout
         case $verb:$reply in
             close:waiting)
                 (( deadline - now > close_interval + request_window + buffer )) || break
@@ -406,19 +415,14 @@ finalize() {
                 verb=confirm
                 payload=("$expected_run") ;;
             confirm:complete)
-                [[ $reply_reason == - ]] || { reason=unexpected_reply; break; }
-                if (( confirm_attempts > 1 )); then
-                    log "event=confirm_retry_recovered attempts=$confirm_attempts run=$expected_run"
-                fi
                 record_final normal - "$expected_run" "$native" "$observed_device"
                 return 0 ;;
-            *) reason=unexpected_reply; break ;;
         esac
     done
-    if [[ $confirm_exhausted == yes ]]; then
-        log "event=confirm_retry_exhausted attempts=$confirm_attempts last_fault=$reason run=$expected_run"
-    elif (( confirm_attempts > 1 )); then
-        log "event=confirm_retry_stopped attempts=$confirm_attempts reason=$reason run=$expected_run"
+    if [[ $retry_exhausted == yes ]]; then
+        log "event=${verb}_retry_exhausted attempts=$attempts last_fault=$reason run=${expected_run:--}"
+    elif [[ $retry_pending == yes ]]; then
+        log "event=${verb}_retry_stopped attempts=$attempts reason=$reason run=${expected_run:--}"
     fi
     record_final failed "$reason" "${expected_run:--}" "$native" "$observed_device"
 }
@@ -438,7 +442,7 @@ report() {
 usage() { printf '%s\n' 'usage: nbd-monitor run|admit|observe-start|finalize|report DEVICE'; }
 
 case ${1:-} in
-    --version) printf '%s\n' 'nbd-monitor 0.0.4'; exit ;;
+    --version) printf '%s\n' 'nbd-monitor 0.0.5'; exit ;;
     --help|-h) usage; exit ;;
     run|admit|observe-start|finalize|report)
         (( $# == 2 )) || die "invalid_arguments"
